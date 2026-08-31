@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonLLM
 
-namespace SeasonLLM;
+namespace Season.LLM;
 
 internal static class NativeMethods
 {
@@ -128,10 +128,19 @@ internal static class NativeMethods
     internal static extern void llama_model_free(IntPtr model);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr llama_adapter_lora_init(IntPtr model, IntPtr pathLora);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern void llama_adapter_lora_free(IntPtr adapter);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern IntPtr llama_init_from_model(IntPtr model, NativeLlamaContextParams @params);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern void llama_free(IntPtr ctx);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern int llama_set_adapters_lora(IntPtr ctx, IntPtr[] adapters, nuint nAdapters, float[] scales);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern uint llama_n_ctx(IntPtr ctx);
@@ -260,6 +269,9 @@ internal static class NativeMethods
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern IntPtr llama_sampler_init_temp(float temperature);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr llama_sampler_init_grammar(IntPtr vocab, IntPtr grammarStr, IntPtr grammarRoot);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern IntPtr llama_sampler_init_penalties(int penaltyLastN, float penaltyRepeat, float penaltyFreq, float penaltyPresent);

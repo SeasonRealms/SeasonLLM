@@ -6,7 +6,7 @@
 		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
 		<LangVersion>preview</LangVersion>
 		<AssemblyName>SeasonLLM</AssemblyName>
-		<RootNamespace>SeasonLLM</RootNamespace>
+		<RootNamespace>Season.LLM</RootNamespace>
 		<PackageId>SeasonLLM</PackageId>
 		<Title>SeasonLLM</Title>
 		<Authors>SeasonRealms</Authors>
@@ -17,7 +17,7 @@
 		<RepositoryUrl>https://github.com/SeasonRealms/SeasonLLM</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PublishRepositoryUrl>true</PublishRepositoryUrl>
-		<Version>0.1.0</Version>
+		<Version>0.2.0</Version>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>

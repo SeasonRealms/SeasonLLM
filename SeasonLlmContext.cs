@@ -2,15 +2,18 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonLLM
 
-namespace SeasonLLM;
+namespace Season.LLM;
 
 public sealed class SeasonLlmContext : IDisposable
 {
     private readonly SeasonLlmModel _model;
     private readonly int _batchSize;
     private readonly int _maxSequences;
+    private readonly int _threadCount;
+    private readonly int _flashAttentionType;
 
     private IntPtr _handle;
+    private MtmdContextHandle? _mtmdContext;
     private bool _disposed;
     private int _position;
 
@@ -42,12 +45,21 @@ public sealed class SeasonLlmContext : IDisposable
                 throw new InvalidOperationException("Failed to create a llama context.");
             }
 
+            _model.ApplyConfiguredLora(_handle);
             NativeMethods.llama_set_n_threads(_handle, native.n_threads, native.n_threads_batch);
             _batchSize = Math.Max((int)NativeMethods.llama_n_batch(_handle), 1);
             _maxSequences = Math.Max((int)NativeMethods.llama_n_seq_max(_handle), 1);
+            _threadCount = native.n_threads;
+            _flashAttentionType = native.flash_attn_type;
         }
         catch
         {
+            if (_handle != IntPtr.Zero)
+            {
+                NativeMethods.llama_free(_handle);
+                _handle = IntPtr.Zero;
+            }
+
             _model.ReturnContext();
             throw;
         }
@@ -138,6 +150,42 @@ public sealed class SeasonLlmContext : IDisposable
         return GenerateInternal(prompt, generationOptions, usedChatTemplate, onChunk, cancellationToken);
     }
 
+    public SeasonLlmGenerationResult CompleteImage(
+        string prompt,
+        byte[] imageBytes,
+        SeasonLlmGenerationOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
+        ArgumentNullException.ThrowIfNull(imageBytes);
+        if (imageBytes.Length == 0)
+        {
+            throw new ArgumentException("Image bytes cannot be empty.", nameof(imageBytes));
+        }
+
+        return GenerateImageInternal(prompt, imageBytes, options ?? new SeasonLlmGenerationOptions(), null, cancellationToken);
+    }
+
+    public SeasonLlmGenerationResult CompleteImageStreaming(
+        string prompt,
+        byte[] imageBytes,
+        Action<SeasonLlmGenerationChunk> onChunk,
+        SeasonLlmGenerationOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
+        ArgumentNullException.ThrowIfNull(imageBytes);
+        ArgumentNullException.ThrowIfNull(onChunk);
+        if (imageBytes.Length == 0)
+        {
+            throw new ArgumentException("Image bytes cannot be empty.", nameof(imageBytes));
+        }
+
+        return GenerateImageInternal(prompt, imageBytes, options ?? new SeasonLlmGenerationOptions(), onChunk, cancellationToken);
+    }
+
     private SeasonLlmGenerationResult GenerateInternal(
         string prompt,
         SeasonLlmGenerationOptions options,
@@ -165,42 +213,101 @@ public sealed class SeasonLlmContext : IDisposable
         try
         {
             EvaluatePrompt(promptTokens, cancellationToken);
+            return GenerateFromCurrentState(prompt, promptTokens, options, usedChatTemplate, onChunk, cancellationToken);
+        }
+        finally
+        {
+            NativeMethods.llama_set_abort_callback(_handle, null, IntPtr.Zero);
+        }
+    }
 
-            if (options.MaxTokens <= 0)
+    private SeasonLlmGenerationResult GenerateImageInternal(
+        string prompt,
+        byte[] imageBytes,
+        SeasonLlmGenerationOptions options,
+        Action<SeasonLlmGenerationChunk>? onChunk,
+        CancellationToken cancellationToken)
+    {
+        EnsureGemma4SingleImageSupport();
+
+        if (!options.UseExistingContext)
+        {
+            Reset();
+        }
+
+        using var abortBridge = CancellationBridge.Create(cancellationToken);
+        NativeMethods.llama_set_abort_callback(
+            _handle,
+            abortBridge is null ? null : CancellationBridge.AbortThunk,
+            abortBridge?.UserData ?? IntPtr.Zero);
+
+        try
+        {
+            using var strings = new Utf8StringArena();
+            using var bitmap = CreateImageBitmap(imageBytes);
+            using var chunks = CreateImagePromptChunks(prompt, bitmap.BitmapHandle, options, strings, out var promptText);
+
+            var promptTokenCount = checked((int)MtmdNativeMethods.mtmd_helper_get_n_tokens(chunks.Handle));
+            var promptTokens = promptTokenCount > 0 ? new int[promptTokenCount] : [];
+            EvaluateImagePrompt(chunks.Handle, options.MaxTokens > 0, cancellationToken);
+
+            return GenerateFromCurrentState(promptText, promptTokens, options, usedChatTemplate: true, onChunk, cancellationToken);
+        }
+        finally
+        {
+            NativeMethods.llama_set_abort_callback(_handle, null, IntPtr.Zero);
+        }
+    }
+
+    private SeasonLlmGenerationResult GenerateFromCurrentState(
+        string prompt,
+        IReadOnlyList<int> promptTokens,
+        SeasonLlmGenerationOptions options,
+        bool usedChatTemplate,
+        Action<SeasonLlmGenerationChunk>? onChunk,
+        CancellationToken cancellationToken)
+    {
+        if (options.MaxTokens <= 0)
+        {
+            return new SeasonLlmGenerationResult(
+                prompt,
+                string.Empty,
+                promptTokens,
+                [],
+                SeasonLlmFinishReason.MaxTokens,
+                null,
+                usedChatTemplate);
+        }
+
+        using var sampler = new SamplerHandle(CreateSampler(options));
+
+        var generatedTokens = new List<int>(Math.Min(options.MaxTokens, 256));
+        var finishReason = SeasonLlmFinishReason.MaxTokens;
+        string? stopSequence = null;
+        var decoder = Encoding.UTF8.GetDecoder();
+        var streamedText = new StringBuilder();
+        var generatedText = string.Empty;
+        var lastStreamedText = string.Empty;
+
+        for (var i = 0; i < options.MaxTokens; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var token = NativeMethods.llama_sampler_sample(sampler.Handle, _handle, -1);
+            if (token == NativeMethods.LlamaTokenNull || NativeMethods.llama_vocab_is_eog(_model.VocabHandle, token))
             {
-                return new SeasonLlmGenerationResult(
-                    prompt,
-                    string.Empty,
-                    promptTokens,
-                    [],
-                    SeasonLlmFinishReason.MaxTokens,
-                    null,
-                    usedChatTemplate);
+                finishReason = SeasonLlmFinishReason.EndOfGeneration;
+                break;
             }
 
-            using var sampler = new SamplerHandle(CreateSampler(options));
+            generatedTokens.Add(token);
 
-            var generatedTokens = new List<int>(Math.Min(options.MaxTokens, 256));
-            var finishReason = SeasonLlmFinishReason.MaxTokens;
-            string? stopSequence = null;
-            var generatedText = string.Empty;
-            var lastStreamedText = string.Empty;
-
-            for (var i = 0; i < options.MaxTokens; i++)
+            var decodedChunk = DecodeUtf8Bytes(decoder, _model.TokenToPieceBytes(token), flush: false);
+            if (decodedChunk.Length > 0)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var token = NativeMethods.llama_sampler_sample(sampler.Handle, _handle, -1);
-                if (token == NativeMethods.LlamaTokenNull || NativeMethods.llama_vocab_is_eog(_model.VocabHandle, token))
-                {
-                    finishReason = SeasonLlmFinishReason.EndOfGeneration;
-                    break;
-                }
-
-                generatedTokens.Add(token);
-
-                var detokenizedText = _model.Detokenize(generatedTokens, removeSpecial: false, unparseSpecial: false);
-                if (TryTrimStopSequence(detokenizedText, options.StopSequences, out stopSequence, out var visibleText))
+                streamedText.Append(decodedChunk);
+                var accumulatedText = streamedText.ToString();
+                if (TryTrimStopSequence(accumulatedText, options.StopSequences, out stopSequence, out var visibleText))
                 {
                     generatedText = visibleText;
                     EmitChunk(onChunk, token, visibleText, ref lastStreamedText);
@@ -208,26 +315,43 @@ public sealed class SeasonLlmContext : IDisposable
                     break;
                 }
 
-                generatedText = detokenizedText;
+                generatedText = accumulatedText;
                 EmitChunk(onChunk, token, generatedText, ref lastStreamedText);
-
-                NativeMethods.llama_sampler_accept(sampler.Handle, token);
-                EvaluateSingleToken(token, cancellationToken);
             }
 
-            return new SeasonLlmGenerationResult(
-                prompt,
-                generatedText,
-                promptTokens,
-                generatedTokens,
-                finishReason,
-                stopSequence,
-                usedChatTemplate);
+            NativeMethods.llama_sampler_accept(sampler.Handle, token);
+            EvaluateSingleToken(token, cancellationToken);
         }
-        finally
+
+        if (finishReason != SeasonLlmFinishReason.StopSequence)
         {
-            NativeMethods.llama_set_abort_callback(_handle, null, IntPtr.Zero);
+            var flushedText = DecodeUtf8Bytes(decoder, [], flush: true);
+            if (flushedText.Length > 0)
+            {
+                streamedText.Append(flushedText);
+                var accumulatedText = streamedText.ToString();
+                if (TryTrimStopSequence(accumulatedText, options.StopSequences, out stopSequence, out var visibleText))
+                {
+                    generatedText = visibleText;
+                    EmitChunk(onChunk, generatedTokens.Count > 0 ? generatedTokens[^1] : 0, visibleText, ref lastStreamedText);
+                    finishReason = SeasonLlmFinishReason.StopSequence;
+                }
+                else
+                {
+                    generatedText = accumulatedText;
+                    EmitChunk(onChunk, generatedTokens.Count > 0 ? generatedTokens[^1] : 0, generatedText, ref lastStreamedText);
+                }
+            }
         }
+
+        return new SeasonLlmGenerationResult(
+            prompt,
+            generatedText,
+            promptTokens,
+            generatedTokens,
+            finishReason,
+            stopSequence,
+            usedChatTemplate);
     }
 
     private void EvaluatePrompt(IReadOnlyList<int> promptTokens, CancellationToken cancellationToken)
@@ -285,6 +409,128 @@ public sealed class SeasonLlmContext : IDisposable
         throw new InvalidOperationException($"llama_decode failed with native status {result}.");
     }
 
+    private MtmdBitmapWrapperHandle CreateImageBitmap(byte[] imageBytes)
+    {
+        var mtmd = EnsureMtmdContext();
+        var wrapper = MtmdNativeMethods.mtmd_helper_bitmap_init_from_buf(mtmd.Handle, imageBytes, (nuint)imageBytes.Length, false);
+        if (wrapper.bitmap == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Failed to decode the supplied image bytes for Gemma 4 multimodal inference.");
+        }
+
+        return new MtmdBitmapWrapperHandle(wrapper);
+    }
+
+    private MtmdInputChunksHandle CreateImagePromptChunks(
+        string prompt,
+        IntPtr bitmapHandle,
+        SeasonLlmGenerationOptions options,
+        Utf8StringArena strings,
+        out string promptText)
+    {
+        var marker = NativeMethods.PtrToString(MtmdNativeMethods.mtmd_default_marker());
+        promptText = SeasonLlmModel.BuildGemma4SingleImagePrompt(prompt, marker);
+
+        var chunksHandle = MtmdNativeMethods.mtmd_input_chunks_init();
+        if (chunksHandle == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Failed to allocate mtmd input chunks.");
+        }
+
+        var chunks = new MtmdInputChunksHandle(chunksHandle);
+        var input = new MtmdNativeMethods.NativeMtmdInputText
+        {
+            text = strings.Add(promptText),
+            add_special = NativeMethods.ToNativeBool(options.AddSpecialTokens),
+            parse_special = NativeMethods.ToNativeBool(options.ParseSpecialTokens)
+        };
+
+        var status = MtmdNativeMethods.mtmd_tokenize(EnsureMtmdContext().Handle, chunksHandle, input, [bitmapHandle], 1);
+        if (status == 0)
+        {
+            return chunks;
+        }
+
+        chunks.Dispose();
+        throw status switch
+        {
+            1 => new InvalidOperationException("The Gemma 4 multimodal prompt marker count does not match the supplied image count."),
+            2 => new InvalidOperationException("Gemma 4 multimodal image preprocessing failed inside mtmd."),
+            _ => new InvalidOperationException($"mtmd_tokenize failed with native status {status}.")
+        };
+    }
+
+    private void EvaluateImagePrompt(IntPtr chunksHandle, bool logitsLast, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var status = MtmdNativeMethods.mtmd_helper_eval_chunks(EnsureMtmdContext().Handle, _handle, chunksHandle, _position, 0, _batchSize, logitsLast, out var newPosition);
+        if (status == 0)
+        {
+            _position = newPosition;
+            return;
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        throw new InvalidOperationException($"mtmd_helper_eval_chunks failed with native status {status}.");
+    }
+
+    private MtmdContextHandle EnsureMtmdContext()
+    {
+        ThrowIfDisposed();
+        if (_mtmdContext is not null)
+        {
+            return _mtmdContext;
+        }
+
+        if (string.IsNullOrWhiteSpace(_model.MmprojPath))
+        {
+            throw new InvalidOperationException("This model was not initialized with MmprojPath, so image input is unavailable.");
+        }
+
+        using var strings = new Utf8StringArena();
+        var ctxParams = MtmdNativeMethods.mtmd_context_params_default();
+        ctxParams.use_gpu = NativeMethods.ToNativeBool(_model.MmprojUseGpu);
+        ctxParams.n_threads = _threadCount;
+        ctxParams.flash_attn_type = _flashAttentionType;
+        ctxParams.image_min_tokens = _model.ImageMinTokens;
+        ctxParams.image_max_tokens = _model.ImageMaxTokens;
+        ctxParams.warmup = 0;
+
+        var handle = MtmdNativeMethods.mtmd_init_from_file(strings.Add(_model.MmprojPath), _model.Handle, ctxParams);
+        if (handle == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Failed to initialize mtmd with the configured mmproj file.");
+        }
+
+        var mtmd = new MtmdContextHandle(handle);
+        if (!MtmdNativeMethods.mtmd_support_vision(handle))
+        {
+            mtmd.Dispose();
+            throw new InvalidOperationException("The configured mmproj/model pair does not expose vision input support.");
+        }
+
+        _mtmdContext = mtmd;
+        return mtmd;
+    }
+
+    private void EnsureGemma4SingleImageSupport()
+    {
+        if (!_model.HasMmproj)
+        {
+            throw new InvalidOperationException("Gemma 4 single-image inference requires a model initialized with MmprojPath.");
+        }
+
+        var modelFileName = Path.GetFileName(_model.ModelPath);
+        if (modelFileName.IndexOf("gemma-4-e4b-it", StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            throw new NotSupportedException("The current multimodal wrapper only supports gemma-4-E4B-it + mmproj for single-image question answering.");
+        }
+    }
+
     private IntPtr CreateSampler(SeasonLlmGenerationOptions options)
     {
         var samplerParams = NativeMethods.llama_sampler_chain_default_params();
@@ -296,6 +542,22 @@ public sealed class SeasonLlmContext : IDisposable
 
         try
         {
+            if (SeasonLlmGrammarHelpers.TryResolveGrammar(options, out var grammar, out var grammarRoot))
+            {
+                using var strings = new Utf8StringArena();
+                var grammarSampler = NativeMethods.llama_sampler_init_grammar(
+                    _model.VocabHandle,
+                    strings.Add(grammar),
+                    strings.Add(grammarRoot));
+
+                if (grammarSampler == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("Failed to initialize the grammar sampler. Check the grammar or JsonSchema.");
+                }
+
+                NativeMethods.llama_sampler_chain_add(chain, grammarSampler);
+            }
+
             if (options.RepeatPenalty != 1.0f || options.FrequencyPenalty != 0f || options.PresencePenalty != 0f)
             {
                 NativeMethods.llama_sampler_chain_add(
@@ -360,6 +622,20 @@ public sealed class SeasonLlmContext : IDisposable
         }
 
         lastStreamedText = accumulatedText;
+    }
+
+    private static string DecodeUtf8Bytes(Decoder decoder, byte[] bytes, bool flush)
+    {
+        ArgumentNullException.ThrowIfNull(decoder);
+
+        if (bytes.Length == 0 && !flush)
+        {
+            return string.Empty;
+        }
+
+        var charBuffer = new char[Encoding.UTF8.GetMaxCharCount(Math.Max(bytes.Length, 1))];
+        var charCount = decoder.GetChars(bytes, 0, bytes.Length, charBuffer, 0, flush);
+        return charCount == 0 ? string.Empty : new string(charBuffer, 0, charCount);
     }
 
     private static string GetStreamingDelta(string previousText, string currentText)
@@ -430,6 +706,9 @@ public sealed class SeasonLlmContext : IDisposable
             _handle = IntPtr.Zero;
         }
 
+        _mtmdContext?.Dispose();
+        _mtmdContext = null;
+
         _model.ReturnContext();
         GC.SuppressFinalize(this);
     }
@@ -442,6 +721,9 @@ public sealed class SeasonLlmContext : IDisposable
             _handle = IntPtr.Zero;
             _model.ReturnContext();
         }
+
+        _mtmdContext?.Dispose();
+        _mtmdContext = null;
     }
 
     private void ThrowIfDisposed()

@@ -2,11 +2,17 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonLLM
 
-namespace SeasonLLM;
+namespace Season.LLM;
 
 public sealed class SeasonLlmModelOptions
 {
     public string ModelPath { get; set; } = string.Empty;
+    public string? LoraPath { get; set; }
+    public float LoraScale { get; set; } = 1.0f;
+    public string? MmprojPath { get; set; }
+    public bool MmprojUseGpu { get; set; } = true;
+    public int ImageMinTokens { get; set; }
+    public int ImageMaxTokens { get; set; }
     public string? Backend { get; set; }
     public string? ParamsBackend { get; set; }
     public int GpuLayers { get; set; }
@@ -52,4 +58,8 @@ public sealed class SeasonLlmGenerationOptions
     public bool UseChatTemplate { get; set; } = true;
     public bool AddAssistantGenerationPrompt { get; set; } = true;
     public string? ChatTemplate { get; set; }
+    public string? Grammar { get; set; }
+    public string GrammarRoot { get; set; } = "root";
+    public bool JsonOutput { get; set; }
+    public string? JsonSchema { get; set; }
 }

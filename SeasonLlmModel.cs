@@ -2,11 +2,12 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonLLM
 
-namespace SeasonLLM;
+namespace Season.LLM;
 
 public sealed class SeasonLlmModel : IDisposable
 {
     private IntPtr _handle;
+    private IntPtr _loraAdapter;
     private bool _disposed;
     private int _activeContexts;
 
@@ -17,7 +18,7 @@ public sealed class SeasonLlmModel : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(options.ModelPath);
 
         using var strings = new Utf8StringArena();
-        using var backendDevices = global::SeasonGGML.GGML.CreateBackendSelection(options.Backend, options.ParamsBackend);
+        using var backendDevices = global::Season.GGML.GGML.CreateBackendSelection(options.Backend, options.ParamsBackend);
 
         var native = NativeMethods.llama_model_default_params();
         native.devices = backendDevices?.Pointer ?? IntPtr.Zero;
@@ -71,13 +72,38 @@ public sealed class SeasonLlmModel : IDisposable
                 "Failed to load llama model. Check the GGUF path and native runtime dependencies.");
         }
 
+        if (!string.IsNullOrWhiteSpace(options.LoraPath))
+        {
+            _loraAdapter = NativeMethods.llama_adapter_lora_init(_handle, strings.Add(options.LoraPath));
+            if (_loraAdapter == IntPtr.Zero)
+            {
+                NativeMethods.llama_model_free(_handle);
+                _handle = IntPtr.Zero;
+                throw new InvalidOperationException("Failed to load the LoRA adapter. Check the GGUF path and base model compatibility.");
+            }
+        }
+
         ModelPath = options.ModelPath;
+        LoraPath = options.LoraPath;
+        LoraScale = options.LoraScale;
+        MmprojPath = options.MmprojPath;
+        MmprojUseGpu = options.MmprojUseGpu;
+        ImageMinTokens = options.ImageMinTokens;
+        ImageMaxTokens = options.ImageMaxTokens;
         Backend = options.Backend;
         ParamsBackend = options.ParamsBackend;
         ResolvedBackends = backendDevices?.Names.ToArray() ?? [];
     }
 
     public string ModelPath { get; }
+    public string? LoraPath { get; }
+    public float LoraScale { get; }
+    public bool HasLora => !string.IsNullOrWhiteSpace(LoraPath) && _loraAdapter != IntPtr.Zero;
+    public string? MmprojPath { get; }
+    public bool MmprojUseGpu { get; }
+    public int ImageMinTokens { get; }
+    public int ImageMaxTokens { get; }
+    public bool HasMmproj => !string.IsNullOrWhiteSpace(MmprojPath);
     public string? Backend { get; }
     public string? ParamsBackend { get; }
     public IReadOnlyList<string> ResolvedBackends { get; }
@@ -256,6 +282,14 @@ public sealed class SeasonLlmModel : IDisposable
     {
         ThrowIfDisposed();
 
+        var buffer = TokenToPieceBytes(token, special);
+        return Encoding.UTF8.GetString(buffer, 0, buffer.Length);
+    }
+
+    internal byte[] TokenToPieceBytes(int token, bool special = false)
+    {
+        ThrowIfDisposed();
+
         var buffer = new byte[256];
         var count = NativeMethods.llama_token_to_piece(VocabHandle, token, buffer, buffer.Length, 0, special);
         if (count < 0)
@@ -269,7 +303,7 @@ public sealed class SeasonLlmModel : IDisposable
             throw new InvalidOperationException($"Failed to convert token {token} to text.");
         }
 
-        return Encoding.UTF8.GetString(buffer, 0, count);
+        return buffer.AsSpan(0, count).ToArray();
     }
 
     public string ApplyChatTemplate(
@@ -294,6 +328,12 @@ public sealed class SeasonLlmModel : IDisposable
             return BuildFallbackChatPrompt(messages, addAssistantGenerationPrompt);
         }
 
+        if (LooksLikeGemma4JinjaTemplate(effectiveTemplate))
+        {
+            // Gemma 4 GGUF metadata currently exposes a full Jinja template string.
+            // The C API path used here only supports recognized built-in template forms.
+            return BuildGemma4ChatPrompt(messages, addAssistantGenerationPrompt);
+        }
         var templatePtr = strings.Add(effectiveTemplate);
         var estimatedLength = Math.Max(256, messages.Sum(static message => message.Content.Length + message.Role.Length + 16) * 4);
         var buffer = new byte[estimatedLength];
@@ -317,6 +357,77 @@ public sealed class SeasonLlmModel : IDisposable
         return Encoding.UTF8.GetString(buffer, 0, count);
     }
 
+    private static bool LooksLikeGemma4JinjaTemplate(string template)
+    {
+        return !string.IsNullOrEmpty(template)
+            && template.Length > 1024
+            && template.StartsWith("{%- macro format_parameters(", StringComparison.Ordinal)
+            && template.Contains("<|turn>", StringComparison.Ordinal)
+            && template.Contains("<turn|>", StringComparison.Ordinal);
+    }
+
+    private static string BuildGemma4ChatPrompt(IReadOnlyList<SeasonLlmChatMessage> messages, bool addAssistantGenerationPrompt)
+    {
+        var builder = new StringBuilder();
+        builder.Append("<bos>");
+
+        var firstMessageIndex = 0;
+        if (messages.Count > 0 && (string.Equals(messages[0].Role, "system", StringComparison.OrdinalIgnoreCase) ||
+                                   string.Equals(messages[0].Role, "developer", StringComparison.OrdinalIgnoreCase)))
+        {
+            builder.AppendLine("<|turn>system");
+            builder.Append(messages[0].Content.Trim());
+            builder.AppendLine();
+            builder.AppendLine("<turn|>");
+            firstMessageIndex = 1;
+        }
+
+        for (var i = firstMessageIndex; i < messages.Count; i++)
+        {
+            var message = messages[i];
+            var role = string.Equals(message.Role, "assistant", StringComparison.OrdinalIgnoreCase)
+                ? "model"
+                : message.Role;
+
+            builder.Append("<|turn>");
+            builder.AppendLine(role);
+            builder.Append(message.Content.Trim());
+            builder.AppendLine();
+            builder.AppendLine("<turn|>");
+        }
+
+        if (addAssistantGenerationPrompt)
+        {
+            builder.AppendLine("<|turn>model");
+            builder.AppendLine("<|channel>thought");
+            builder.Append("<channel|>");
+        }
+
+        return builder.ToString();
+    }
+
+    internal static string BuildGemma4SingleImagePrompt(string prompt, string mediaMarker, string? systemPrompt = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
+        ArgumentException.ThrowIfNullOrWhiteSpace(mediaMarker);
+
+        var builder = new StringBuilder();
+        builder.Append("<bos>");
+        builder.AppendLine("<|turn>system");
+        builder.Append(string.IsNullOrWhiteSpace(systemPrompt) ? "You are a concise and helpful assistant." : systemPrompt.Trim());
+        builder.AppendLine();
+        builder.AppendLine("<turn|>");
+        builder.AppendLine("<|turn>user");
+        builder.AppendLine(mediaMarker);
+        builder.Append(prompt.Trim());
+        builder.AppendLine();
+        builder.AppendLine("<turn|>");
+        builder.AppendLine("<|turn>model");
+        builder.AppendLine("<|channel>thought");
+        builder.Append("<channel|>");
+        return builder.ToString();
+    }
+
     internal void RentContext()
     {
         ThrowIfDisposed();
@@ -326,6 +437,21 @@ public sealed class SeasonLlmModel : IDisposable
     internal void ReturnContext()
     {
         Interlocked.Decrement(ref _activeContexts);
+    }
+
+    internal void ApplyConfiguredLora(IntPtr contextHandle)
+    {
+        ThrowIfDisposed();
+        if (_loraAdapter == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var status = NativeMethods.llama_set_adapters_lora(contextHandle, [_loraAdapter], 1, [LoraScale]);
+        if (status != 0)
+        {
+            throw new InvalidOperationException($"Failed to apply the LoRA adapter to the context. Native status: {status}.");
+        }
     }
 
     internal static string BuildFallbackChatPrompt(IReadOnlyList<SeasonLlmChatMessage> messages, bool addAssistantGenerationPrompt)
@@ -360,6 +486,12 @@ public sealed class SeasonLlmModel : IDisposable
 
         _disposed = true;
 
+        if (_loraAdapter != IntPtr.Zero)
+        {
+            NativeMethods.llama_adapter_lora_free(_loraAdapter);
+            _loraAdapter = IntPtr.Zero;
+        }
+
         if (_handle != IntPtr.Zero)
         {
             NativeMethods.llama_model_free(_handle);
@@ -371,6 +503,12 @@ public sealed class SeasonLlmModel : IDisposable
 
     ~SeasonLlmModel()
     {
+        if (_loraAdapter != IntPtr.Zero)
+        {
+            NativeMethods.llama_adapter_lora_free(_loraAdapter);
+            _loraAdapter = IntPtr.Zero;
+        }
+
         if (_handle != IntPtr.Zero)
         {
             NativeMethods.llama_model_free(_handle);

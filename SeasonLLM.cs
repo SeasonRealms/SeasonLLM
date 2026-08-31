@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonLLM
 
-namespace SeasonLLM;
+namespace Season.LLM;
 
 public static class SeasonLLM
 {
@@ -80,7 +80,7 @@ public static class SeasonLLM
     public static IReadOnlyList<string> GetAvailableBackends()
     {
         EnsureInitialized();
-        return global::SeasonGGML.GGML.GetAvailableBackends()
+        return global::Season.GGML.GGML.GetAvailableBackends()
             .Select(static backend => backend.Name)
             .ToArray();
     }

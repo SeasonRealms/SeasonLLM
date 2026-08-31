@@ -24,6 +24,9 @@ First-stage managed wrapper focus:
 - Streaming output
 - Cancellation via `CancellationToken`
 - Tokenization helpers
+- Grammar-constrained output
+- Single LoRA adapter loading at model initialization
+- Gemma 4 E4B single-image question answering via `mmproj`
 
 ## Quick Start
 
@@ -101,8 +104,120 @@ ctx.CompleteStreaming(
     });
 ```
 
+## Grammar / JSON
+
+```csharp
+var grammarResult = ctx.Chat(
+[
+    new SeasonLlmChatMessage("user", "Return a JSON object with title and priority.")
+],
+new SeasonLlmGenerationOptions
+{
+    MaxTokens = 128,
+    Temperature = 0.2f,
+    JsonSchema = """
+    {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "priority": { "type": "string", "enum": ["low", "medium", "high"] }
+      },
+      "required": ["title", "priority"],
+      "additionalProperties": false
+    }
+    """
+});
+
+Console.WriteLine(grammarResult.Text);
+```
+
+You can also pass raw GBNF directly:
+
+```csharp
+var result = ctx.Complete(
+    "Respond with yes or no only.",
+    new SeasonLlmGenerationOptions
+    {
+        MaxTokens = 8,
+        Grammar = """
+        root ::= "yes" | "no"
+        """
+    });
+```
+
+`JsonOutput = true` enables unconstrained JSON object output without a schema.
+
+The current `JsonSchema` converter supports a practical subset:
+
+- `type`
+- `properties`
+- `required`
+- `additionalProperties: false`
+- `items`
+- `minItems` / `maxItems`
+- `minLength` / `maxLength`
+- `enum`
+- `const`
+
+Unsupported schema keywords currently throw `NotSupportedException`.
+
+## LoRA
+
+```csharp
+using var model = SeasonLLM.CreateModel(new SeasonLlmModelOptions
+{
+    ModelPath = @"C:\Models\Qwen3-4B-Instruct-Q4_K_M.gguf",
+    LoraPath = @"C:\Models\qwen3-writing-style-lora.gguf",
+    LoraScale = 1.0f,
+    Backend = "cuda0",
+    GpuLayers = -1
+});
+
+using var ctx = model.CreateContext(new SeasonLlmContextOptions
+{
+    ContextSize = 8192,
+    BatchSize = 512
+});
+
+var result = ctx.Complete("Write a short product tagline.");
+Console.WriteLine(result.Text);
+```
+
+The current wrapper applies at most one LoRA adapter per model and automatically enables it for every context created from that model.
+
+## Gemma 4 Single Image
+
+This wrapper currently exposes a narrow multimodal path for `gemma-4-E4B-it` only.
+You must load the text model together with its `mmproj` file, then call `CompleteImage()` or `CompleteImageStreaming()` with encoded image bytes such as PNG or JPEG.
+
+```csharp
+using var model = SeasonLLM.CreateModel(new SeasonLlmModelOptions
+{
+    ModelPath = @"C:\Models\gemma-4-E4B-it-Q4_K_M.gguf",
+    MmprojPath = @"C:\Models\mmproj-BF16.gguf",
+    MmprojUseGpu = true,
+    ImageMaxTokens = 560,
+    Backend = "cuda0",
+    GpuLayers = -1
+});
+
+using var ctx = model.CreateContext();
+
+var result = ctx.CompleteImageStreaming(
+    "Describe the UI shown in this screenshot.",
+    File.ReadAllBytes(@"C:\Images\screen.png"),
+    chunk => Console.Write(chunk.Text));
+```
+
+Current limitations:
+
+- Only `gemma-4-E4B-it` is supported.
+- Only a single image is supported per request.
+- The multimodal API accepts encoded image bytes, not decoded RGBA buffers.
+- Existing text `Chat()` and `Complete()` behavior is unchanged.
+
 ## Notes
 
 - `llama.cpp` logging is global, just like `SeasonImage` progress and log callbacks.
 - The current wrapper keeps the public API intentionally small.
-- Advanced features such as embeddings, LoRA, state save/load, grammar-constrained output, and KV sequence management can be added later on top of the same native binding layer.
+- Advanced features such as embeddings, richer multimodal input, state save/load, and KV sequence management can be added later on top of the same native binding layer.

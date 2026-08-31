@@ -2,9 +2,7 @@
 // Licensed under the MIT License.
 // https://github.com/SeasonRealms/SeasonLLM
 
-using System.Globalization;
-
-namespace SeasonLLM;
+namespace Season.LLM;
 
 internal sealed class Utf8StringArena : IDisposable
 {
