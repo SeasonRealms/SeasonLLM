@@ -158,23 +158,54 @@ internal sealed unsafe class LlamaBatchBuffer : IDisposable
 
 internal sealed class CancellationBridge : IDisposable
 {
+    // ==== TEMPORARY DIAGNOSTICS: trace abort-callback behavior (remove after debugging) ====
+    private static long s_thunkCalls;
+    private static IntPtr s_lastThunkData;
+    private static int s_bridgeSeq;
+
     private static readonly NativeMethods.GgmlAbortCallback s_abortThunk = static data =>
     {
         if (data == IntPtr.Zero)
         {
-            return false;
+            return (byte)0;
         }
 
-        var handle = GCHandle.FromIntPtr(data);
-        return handle.Target is CancellationToken token && token.IsCancellationRequested;
+        object? target;
+        try
+        {
+            target = GCHandle.FromIntPtr(data).Target;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[SeasonLLM][AbortThunk] INVALID GCHandle data=0x{data.ToInt64():X} ex={ex.GetType().Name}: {ex.Message}");
+            return (byte)0;
+        }
+
+        var token = target as CancellationToken?;
+        var canceled = token?.IsCancellationRequested == true;
+
+        var call = System.Threading.Interlocked.Increment(ref s_thunkCalls);
+        if (call == 1 || data != s_lastThunkData || canceled || token is null)
+        {
+            s_lastThunkData = data;
+            System.Diagnostics.Debug.WriteLine(
+                $"[SeasonLLM][AbortThunk] call#{call} data=0x{data.ToInt64():X} targetType={(target?.GetType().Name ?? "null")} canceled={canceled} tokenHash={(token is CancellationToken t ? t.GetHashCode().ToString() : "n/a")}");
+        }
+
+        return (byte)(canceled ? 1 : 0);
     };
 
     private GCHandle _tokenHandle;
     private bool _disposed;
+    private readonly int _seq;
 
     private CancellationBridge(CancellationToken token)
     {
         _tokenHandle = GCHandle.Alloc(token);
+        _seq = System.Threading.Interlocked.Increment(ref s_bridgeSeq);
+        System.Diagnostics.Debug.WriteLine(
+            $"[SeasonLLM][AbortThunk] bridge#{_seq} CREATED data=0x{GCHandle.ToIntPtr(_tokenHandle).ToInt64():X} canBeCanceled={token.CanBeCanceled} alreadyCanceled={token.IsCancellationRequested} tokenHash={token.GetHashCode()}");
     }
 
     public IntPtr UserData => GCHandle.ToIntPtr(_tokenHandle);
@@ -193,6 +224,8 @@ internal sealed class CancellationBridge : IDisposable
         }
 
         _disposed = true;
+        System.Diagnostics.Debug.WriteLine(
+            $"[SeasonLLM][AbortThunk] bridge#{_seq} DISPOSED data=0x{GCHandle.ToIntPtr(_tokenHandle).ToInt64():X}");
         if (_tokenHandle.IsAllocated)
         {
             _tokenHandle.Free();

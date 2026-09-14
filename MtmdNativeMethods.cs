@@ -71,7 +71,7 @@ internal static class MtmdNativeMethods
     internal static extern void mtmd_input_chunks_free(IntPtr chunks);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-    internal static extern int mtmd_tokenize(IntPtr ctx, IntPtr output, NativeMtmdInputText text, IntPtr[] bitmaps, nuint nBitmaps);
+    internal static extern int mtmd_tokenize(IntPtr ctx, IntPtr output, ref NativeMtmdInputText text, IntPtr[] bitmaps, nuint nBitmaps);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern nuint mtmd_helper_get_n_tokens(IntPtr chunks);

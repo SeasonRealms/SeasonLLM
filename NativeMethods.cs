@@ -98,10 +98,10 @@ internal static class NativeMethods
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate bool NativeProgressCallback(float progress, IntPtr userData);
+    internal delegate byte NativeProgressCallback(float progress, IntPtr userData);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate bool GgmlAbortCallback(IntPtr data);
+    internal delegate byte GgmlAbortCallback(IntPtr data);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void GgmlLogCallback(int level, IntPtr text, IntPtr userData);

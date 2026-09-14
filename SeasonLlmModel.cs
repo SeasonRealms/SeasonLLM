@@ -40,12 +40,12 @@ public sealed class SeasonLlmModel : IDisposable
             {
                 if (userData == IntPtr.Zero)
                 {
-                    return true;
+                    return (byte)1;
                 }
 
                 var callback = GCHandle.FromIntPtr(userData).Target as Action<float>;
                 callback?.Invoke(progress);
-                return true;
+                return (byte)1;
             };
 
             native.progress_callback = Marshal.GetFunctionPointerForDelegate(progressThunk);
