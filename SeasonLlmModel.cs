@@ -104,6 +104,8 @@ public sealed class SeasonLlmModel : IDisposable
     public int ImageMinTokens { get; }
     public int ImageMaxTokens { get; }
     public bool HasMmproj => !string.IsNullOrWhiteSpace(MmprojPath);
+    internal bool IsGemma4SingleImageModel =>
+        Path.GetFileName(ModelPath).IndexOf("gemma-4-e4b-it", StringComparison.OrdinalIgnoreCase) >= 0;
     public string? Backend { get; }
     public string? ParamsBackend { get; }
     public IReadOnlyList<string> ResolvedBackends { get; }
@@ -406,6 +408,8 @@ public sealed class SeasonLlmModel : IDisposable
         return builder.ToString();
     }
 
+    internal const string DefaultImageSystemPrompt = "You are a concise and helpful assistant.";
+
     internal static string BuildGemma4SingleImagePrompt(string prompt, string mediaMarker, string? systemPrompt = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -414,7 +418,7 @@ public sealed class SeasonLlmModel : IDisposable
         var builder = new StringBuilder();
         builder.Append("<bos>");
         builder.AppendLine("<|turn>system");
-        builder.Append(string.IsNullOrWhiteSpace(systemPrompt) ? "You are a concise and helpful assistant." : systemPrompt.Trim());
+        builder.Append(string.IsNullOrWhiteSpace(systemPrompt) ? DefaultImageSystemPrompt : systemPrompt.Trim());
         builder.AppendLine();
         builder.AppendLine("<turn|>");
         builder.AppendLine("<|turn>user");
@@ -425,6 +429,67 @@ public sealed class SeasonLlmModel : IDisposable
         builder.AppendLine("<|turn>model");
         builder.AppendLine("<|channel>thought");
         builder.Append("<channel|>");
+        return builder.ToString();
+    }
+
+    internal static string BuildSingleImageChatPrompt(
+        SeasonLlmModel model,
+        string prompt,
+        string mediaMarker,
+        string? systemPrompt = null)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
+        ArgumentException.ThrowIfNullOrWhiteSpace(mediaMarker);
+
+        if (model.IsGemma4SingleImageModel)
+        {
+            return BuildGemma4SingleImagePrompt(prompt, mediaMarker, systemPrompt);
+        }
+
+        var effectiveSystemPrompt = string.IsNullOrWhiteSpace(systemPrompt)
+            ? DefaultImageSystemPrompt
+            : systemPrompt.Trim();
+        if (!string.IsNullOrWhiteSpace(model.DefaultChatTemplate))
+        {
+            try
+            {
+                var templated = model.ApplyChatTemplate(
+                    [
+                        new SeasonLlmChatMessage("system", effectiveSystemPrompt),
+                        new SeasonLlmChatMessage("user", $"{mediaMarker}\n{prompt.Trim()}")
+                    ],
+                    addAssistantGenerationPrompt: true);
+
+                if (!string.IsNullOrWhiteSpace(templated) && templated.Contains(mediaMarker, StringComparison.Ordinal))
+                {
+                    return templated;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Fall through to the explicit ChatML prompt when the model template cannot be applied.
+            }
+        }
+
+        return BuildChatMlSingleImagePrompt(prompt, mediaMarker, effectiveSystemPrompt);
+    }
+
+    internal static string BuildChatMlSingleImagePrompt(string prompt, string mediaMarker, string? systemPrompt = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
+        ArgumentException.ThrowIfNullOrWhiteSpace(mediaMarker);
+
+        var builder = new StringBuilder();
+        builder.Append("<|im_start|>system\n");
+        builder.Append(string.IsNullOrWhiteSpace(systemPrompt) ? DefaultImageSystemPrompt : systemPrompt.Trim());
+        builder.Append("<|im_end|>\n");
+        builder.Append("<|im_start|>user\n");
+        builder.Append(mediaMarker);
+        builder.Append('\n');
+        builder.Append(prompt.Trim());
+        builder.Append("<|im_end|>\n");
+        builder.Append("<|im_start|>assistant\n");
         return builder.ToString();
     }
 

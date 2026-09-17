@@ -26,7 +26,7 @@ First-stage managed wrapper focus:
 - Tokenization helpers
 - Grammar-constrained output
 - Single LoRA adapter loading at model initialization
-- Gemma 4 E4B single-image question answering via `mmproj`
+- Single-image question answering via `mmproj` (Gemma 4 E4B, Qwen3.5, and other GGUF vision pairs)
 
 ## Quick Start
 
@@ -185,15 +185,16 @@ Console.WriteLine(result.Text);
 
 The current wrapper applies at most one LoRA adapter per model and automatically enables it for every context created from that model.
 
-## Gemma 4 Single Image
+## Single Image
 
-This wrapper currently exposes a narrow multimodal path for `gemma-4-E4B-it` only.
-You must load the text model together with its `mmproj` file, then call `CompleteImage()` or `CompleteImageStreaming()` with encoded image bytes such as PNG or JPEG.
+The wrapper exposes a single-image multimodal path for any text model loaded together with a matching `mmproj` projector file, such as `gemma-4-E4B-it` or `Qwen3.5-0.8B`.
+Call `CompleteImage()` or `CompleteImageStreaming()` with encoded image bytes such as PNG or JPEG.
+The prompt is built from the model's own chat template when available, with an explicit ChatML fallback, so different model families are formatted correctly.
 
 ```csharp
 using var model = SeasonLLM.CreateModel(new SeasonLlmModelOptions
 {
-    ModelPath = @"C:\Models\gemma-4-E4B-it-Q4_K_M.gguf",
+    ModelPath = @"C:\Models\Qwen3.5-0.8B-Q4_K_M.gguf",
     MmprojPath = @"C:\Models\mmproj-BF16.gguf",
     MmprojUseGpu = true,
     ImageMaxTokens = 560,
@@ -206,12 +207,13 @@ using var ctx = model.CreateContext();
 var result = ctx.CompleteImageStreaming(
     "Describe the UI shown in this screenshot.",
     File.ReadAllBytes(@"C:\Images\screen.png"),
-    chunk => Console.Write(chunk.Text));
+    chunk => Console.Write(chunk.Text),
+    systemPrompt: "You are a concise and helpful assistant.");
 ```
 
 Current limitations:
 
-- Only `gemma-4-E4B-it` is supported.
+- The `mmproj` file must match the text model; an incompatible pair fails at mtmd initialization.
 - Only a single image is supported per request.
 - The multimodal API accepts encoded image bytes, not decoded RGBA buffers.
 - Existing text `Chat()` and `Complete()` behavior is unchanged.

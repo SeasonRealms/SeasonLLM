@@ -154,7 +154,8 @@ public sealed class SeasonLlmContext : IDisposable
         string prompt,
         byte[] imageBytes,
         SeasonLlmGenerationOptions? options = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? systemPrompt = null)
     {
         ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -164,7 +165,7 @@ public sealed class SeasonLlmContext : IDisposable
             throw new ArgumentException("Image bytes cannot be empty.", nameof(imageBytes));
         }
 
-        return GenerateImageInternal(prompt, imageBytes, options ?? new SeasonLlmGenerationOptions(), null, cancellationToken);
+        return GenerateImageInternal(prompt, imageBytes, options ?? new SeasonLlmGenerationOptions(), null, cancellationToken, systemPrompt);
     }
 
     public SeasonLlmGenerationResult CompleteImageStreaming(
@@ -172,7 +173,8 @@ public sealed class SeasonLlmContext : IDisposable
         byte[] imageBytes,
         Action<SeasonLlmGenerationChunk> onChunk,
         SeasonLlmGenerationOptions? options = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? systemPrompt = null)
     {
         ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
@@ -183,7 +185,7 @@ public sealed class SeasonLlmContext : IDisposable
             throw new ArgumentException("Image bytes cannot be empty.", nameof(imageBytes));
         }
 
-        return GenerateImageInternal(prompt, imageBytes, options ?? new SeasonLlmGenerationOptions(), onChunk, cancellationToken);
+        return GenerateImageInternal(prompt, imageBytes, options ?? new SeasonLlmGenerationOptions(), onChunk, cancellationToken, systemPrompt);
     }
 
     private SeasonLlmGenerationResult GenerateInternal(
@@ -226,20 +228,21 @@ public sealed class SeasonLlmContext : IDisposable
         byte[] imageBytes,
         SeasonLlmGenerationOptions options,
         Action<SeasonLlmGenerationChunk>? onChunk,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? systemPrompt = null)
     {
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 1: EnsureGemma4SingleImageSupport");
-        EnsureGemma4SingleImageSupport();
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 1: EnsureImageSupport");
+        EnsureImageSupport();
 
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 2: Reset (if needed)");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 2: Reset (if needed)");
         if (!options.UseExistingContext)
         {
             Reset();
         }
 
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 3: Create abortBridge");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 3: Create abortBridge");
         using var abortBridge = CancellationBridge.Create(cancellationToken);
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 4: llama_set_abort_callback");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 4: llama_set_abort_callback");
         NativeMethods.llama_set_abort_callback(
             _handle,
             abortBridge is null ? null : CancellationBridge.AbortThunk,
@@ -247,25 +250,25 @@ public sealed class SeasonLlmContext : IDisposable
 
         try
         {
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 5: Create Utf8StringArena");
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 5: Create Utf8StringArena");
             using var strings = new Utf8StringArena();
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 6: CreateImageBitmap");
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 6: CreateImageBitmap");
             using var bitmap = CreateImageBitmap(imageBytes);
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 7: CreateImagePromptChunks");
-            using var chunks = CreateImagePromptChunks(prompt, bitmap.BitmapHandle, options, strings, out var promptText);
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 7: CreateImagePromptChunks");
+            using var chunks = CreateImagePromptChunks(prompt, bitmap.BitmapHandle, options, strings, systemPrompt, out var promptText);
 
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 8: mtmd_helper_get_n_tokens");
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 8: mtmd_helper_get_n_tokens");
             var promptTokenCount = checked((int)MtmdNativeMethods.mtmd_helper_get_n_tokens(chunks.Handle));
             var promptTokens = promptTokenCount > 0 ? new int[promptTokenCount] : [];
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 9: EvaluateImagePrompt");
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 9: EvaluateImagePrompt");
             EvaluateImagePrompt(chunks.Handle, options.MaxTokens > 0, cancellationToken);
 
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] step 10: GenerateFromCurrentState");
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 10: GenerateFromCurrentState");
             return GenerateFromCurrentState(promptText, promptTokens, options, usedChatTemplate: true, onChunk, cancellationToken);
         }
         finally
         {
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] finally: clear abort_callback");
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] finally: clear abort_callback");
             NativeMethods.llama_set_abort_callback(_handle, null, IntPtr.Zero);
         }
     }
@@ -422,14 +425,14 @@ public sealed class SeasonLlmContext : IDisposable
 
     private MtmdBitmapWrapperHandle CreateImageBitmap(byte[] imageBytes)
     {
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImageBitmap: imageBytes.Length={imageBytes?.Length ?? -1}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImageBitmap: imageBytes.Length={imageBytes?.Length ?? -1}");
         var mtmd = EnsureMtmdContext();
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImageBitmap: mtmd.Handle=0x{mtmd.Handle.ToInt64():X}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImageBitmap: mtmd.Handle=0x{mtmd.Handle.ToInt64():X}");
         var wrapper = MtmdNativeMethods.mtmd_helper_bitmap_init_from_buf(mtmd.Handle, imageBytes, (nuint)imageBytes.Length, false);
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImageBitmap: wrapper.bitmap=0x{wrapper.bitmap.ToInt64():X}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImageBitmap: wrapper.bitmap=0x{wrapper.bitmap.ToInt64():X}");
         if (wrapper.bitmap == IntPtr.Zero)
         {
-            throw new InvalidOperationException("Failed to decode the supplied image bytes for Gemma 4 multimodal inference.");
+            throw new InvalidOperationException("Failed to decode the supplied image bytes for multimodal inference.");
         }
 
         return new MtmdBitmapWrapperHandle(wrapper);
@@ -440,17 +443,18 @@ public sealed class SeasonLlmContext : IDisposable
         IntPtr bitmapHandle,
         SeasonLlmGenerationOptions options,
         Utf8StringArena strings,
+        string? systemPrompt,
         out string promptText)
     {
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] CreateImagePromptChunks: getting default marker");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] CreateImagePromptChunks: getting default marker");
         var marker = NativeMethods.PtrToString(MtmdNativeMethods.mtmd_default_marker());
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImagePromptChunks: marker='{marker}'");
-        promptText = SeasonLlmModel.BuildGemma4SingleImagePrompt(prompt, marker);
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImagePromptChunks: promptText.Length={promptText?.Length ?? -1}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImagePromptChunks: marker='{marker}'");
+        promptText = SeasonLlmModel.BuildSingleImageChatPrompt(_model, prompt, marker, systemPrompt);
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImagePromptChunks: promptText.Length={promptText?.Length ?? -1}");
 
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] CreateImagePromptChunks: mtmd_input_chunks_init");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] CreateImagePromptChunks: mtmd_input_chunks_init");
         var chunksHandle = MtmdNativeMethods.mtmd_input_chunks_init();
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImagePromptChunks: chunksHandle=0x{chunksHandle.ToInt64():X}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImagePromptChunks: chunksHandle=0x{chunksHandle.ToInt64():X}");
         if (chunksHandle == IntPtr.Zero)
         {
             throw new InvalidOperationException("Failed to allocate mtmd input chunks.");
@@ -458,7 +462,7 @@ public sealed class SeasonLlmContext : IDisposable
 
         var chunks = new MtmdInputChunksHandle(chunksHandle);
         var inputTextPtr = strings.Add(promptText);
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImagePromptChunks: input.text=0x{inputTextPtr.ToInt64():X}, add_special={options.AddSpecialTokens}, parse_special={options.ParseSpecialTokens}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImagePromptChunks: input.text=0x{inputTextPtr.ToInt64():X}, add_special={options.AddSpecialTokens}, parse_special={options.ParseSpecialTokens}");
         var input = new MtmdNativeMethods.NativeMtmdInputText
         {
             text = inputTextPtr,
@@ -466,9 +470,9 @@ public sealed class SeasonLlmContext : IDisposable
             parse_special = NativeMethods.ToNativeBool(options.ParseSpecialTokens)
         };
 
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImagePromptChunks: calling mtmd_tokenize, ctx=0x{EnsureMtmdContext().Handle.ToInt64():X}, bitmapHandle=0x{bitmapHandle.ToInt64():X}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImagePromptChunks: calling mtmd_tokenize, ctx=0x{EnsureMtmdContext().Handle.ToInt64():X}, bitmapHandle=0x{bitmapHandle.ToInt64():X}");
         var status = MtmdNativeMethods.mtmd_tokenize(EnsureMtmdContext().Handle, chunksHandle, ref input, [bitmapHandle], 1);
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] CreateImagePromptChunks: mtmd_tokenize returned status={status}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImagePromptChunks: mtmd_tokenize returned status={status}");
         if (status == 0)
         {
             return chunks;
@@ -477,8 +481,8 @@ public sealed class SeasonLlmContext : IDisposable
         chunks.Dispose();
         throw status switch
         {
-            1 => new InvalidOperationException("The Gemma 4 multimodal prompt marker count does not match the supplied image count."),
-            2 => new InvalidOperationException("Gemma 4 multimodal image preprocessing failed inside mtmd."),
+            1 => new InvalidOperationException("The multimodal prompt marker count does not match the supplied image count."),
+            2 => new InvalidOperationException("Multimodal image preprocessing failed inside mtmd."),
             _ => new InvalidOperationException($"mtmd_tokenize failed with native status {status}.")
         };
     }
@@ -506,7 +510,7 @@ public sealed class SeasonLlmContext : IDisposable
         ThrowIfDisposed();
         if (_mtmdContext is not null)
         {
-            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] EnsureMtmdContext: already initialized");
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: already initialized");
             return _mtmdContext;
         }
 
@@ -515,10 +519,10 @@ public sealed class SeasonLlmContext : IDisposable
             throw new InvalidOperationException("This model was not initialized with MmprojPath, so image input is unavailable.");
         }
 
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] EnsureMtmdContext: initializing mtmd, MmprojPath={_model.MmprojPath}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: initializing mtmd, MmprojPath={_model.MmprojPath}");
         using var strings = new Utf8StringArena();
         var ctxParams = MtmdNativeMethods.mtmd_context_params_default();
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] EnsureMtmdContext: ctxParams_default returned, use_gpu={ctxParams.use_gpu}, n_threads={ctxParams.n_threads}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: ctxParams_default returned, use_gpu={ctxParams.use_gpu}, n_threads={ctxParams.n_threads}");
         ctxParams.use_gpu = NativeMethods.ToNativeBool(_model.MmprojUseGpu);
         ctxParams.n_threads = _threadCount;
         ctxParams.flash_attn_type = _flashAttentionType;
@@ -526,38 +530,32 @@ public sealed class SeasonLlmContext : IDisposable
         ctxParams.image_max_tokens = _model.ImageMaxTokens;
         ctxParams.warmup = 0;
 
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] EnsureMtmdContext: calling mtmd_init_from_file");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: calling mtmd_init_from_file");
         var handle = MtmdNativeMethods.mtmd_init_from_file(strings.Add(_model.MmprojPath), _model.Handle, ctxParams);
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Gemma4] EnsureMtmdContext: mtmd_init_from_file returned 0x{handle.ToInt64():X}");
+        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: mtmd_init_from_file returned 0x{handle.ToInt64():X}");
         if (handle == IntPtr.Zero)
         {
             throw new InvalidOperationException("Failed to initialize mtmd with the configured mmproj file.");
         }
 
         var mtmd = new MtmdContextHandle(handle);
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] EnsureMtmdContext: checking mtmd_support_vision");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: checking mtmd_support_vision");
         if (!MtmdNativeMethods.mtmd_support_vision(handle))
         {
             mtmd.Dispose();
             throw new InvalidOperationException("The configured mmproj/model pair does not expose vision input support.");
         }
 
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Gemma4] EnsureMtmdContext: mtmd initialized successfully");
+        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: mtmd initialized successfully");
         _mtmdContext = mtmd;
         return mtmd;
     }
 
-    private void EnsureGemma4SingleImageSupport()
+    private void EnsureImageSupport()
     {
         if (!_model.HasMmproj)
         {
-            throw new InvalidOperationException("Gemma 4 single-image inference requires a model initialized with MmprojPath.");
-        }
-
-        var modelFileName = Path.GetFileName(_model.ModelPath);
-        if (modelFileName.IndexOf("gemma-4-e4b-it", StringComparison.OrdinalIgnoreCase) < 0)
-        {
-            throw new NotSupportedException("The current multimodal wrapper only supports gemma-4-E4B-it + mmproj for single-image question answering.");
+            throw new InvalidOperationException("Single-image inference requires a model initialized with MmprojPath.");
         }
     }
 
