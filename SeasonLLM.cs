@@ -58,18 +58,27 @@ public static class SeasonLLM
             return;
         }
 
-        s_logThunk = static (level, text, _) =>
-        {
-            var managed = s_logCallback;
-            if (managed is null)
-            {
-                return;
-            }
-
-            managed((SeasonLlmLogLevel)level, NativeMethods.PtrToString(text));
-        };
-
+        s_logThunk = LogThunk;
         NativeMethods.llama_log_set(s_logThunk, IntPtr.Zero);
+    }
+
+    // The native side keeps this function pointer for the process lifetime, so the thunk
+    // must be a static method with MonoPInvokeCallback: the AOT compiler then pre-generates
+    // its native-to-managed wrapper. A lambda (or any other unattributed method) would need
+    // that wrapper JIT-compiled on first use, which aborts aot-only Release builds with
+    // "Attempting to JIT compile method '(wrapper native-to-managed) ...'".
+#if IOS || MACCATALYST
+    [ObjCRuntime.MonoPInvokeCallback(typeof(NativeMethods.GgmlLogCallback))]
+#endif
+    private static void LogThunk(int level, IntPtr text, IntPtr userData)
+    {
+        var managed = s_logCallback;
+        if (managed is null)
+        {
+            return;
+        }
+
+        managed((SeasonLlmLogLevel)level, NativeMethods.PtrToString(text));
     }
 
     public static SeasonLlmModel CreateModel(SeasonLlmModelOptions options)

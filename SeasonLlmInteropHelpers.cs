@@ -163,7 +163,14 @@ internal sealed class CancellationBridge : IDisposable
     private static IntPtr s_lastThunkData;
     private static int s_bridgeSeq;
 
-    private static readonly NativeMethods.GgmlAbortCallback s_abortThunk = static data =>
+    // Static thunk with MonoPInvokeCallback: the AOT compiler pre-generates the
+    // native-to-managed wrapper. A lambda would need that wrapper JIT-compiled on
+    // first use, which aborts aot-only Release builds with
+    // "Attempting to JIT compile method '(wrapper native-to-managed) ...'".
+#if IOS || MACCATALYST
+    [ObjCRuntime.MonoPInvokeCallback(typeof(NativeMethods.GgmlAbortCallback))]
+#endif
+    private static byte AbortThunkImpl(IntPtr data)
     {
         if (data == IntPtr.Zero)
         {
@@ -194,7 +201,9 @@ internal sealed class CancellationBridge : IDisposable
         }
 
         return (byte)(canceled ? 1 : 0);
-    };
+    }
+
+    private static readonly NativeMethods.GgmlAbortCallback s_abortThunk = AbortThunkImpl;
 
     private GCHandle _tokenHandle;
     private bool _disposed;

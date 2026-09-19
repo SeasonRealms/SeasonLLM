@@ -11,6 +11,25 @@ public sealed class SeasonLlmModel : IDisposable
     private bool _disposed;
     private int _activeContexts;
 
+    // Static thunk with MonoPInvokeCallback: the AOT compiler pre-generates the
+    // native-to-managed wrapper. A lambda would need that wrapper JIT-compiled on
+    // first use, which aborts aot-only Release builds with
+    // "Attempting to JIT compile method '(wrapper native-to-managed) ...'".
+#if IOS || MACCATALYST
+    [ObjCRuntime.MonoPInvokeCallback(typeof(NativeMethods.NativeProgressCallback))]
+#endif
+    private static byte LoadProgressThunk(float progress, IntPtr userData)
+    {
+        if (userData == IntPtr.Zero)
+        {
+            return (byte)1;
+        }
+
+        var callback = GCHandle.FromIntPtr(userData).Target as Action<float>;
+        callback?.Invoke(progress);
+        return (byte)1;
+    }
+
     internal SeasonLlmModel(SeasonLlmModelOptions options)
     {
         SeasonLLM.EnsureSupported();
@@ -36,17 +55,7 @@ public sealed class SeasonLlmModel : IDisposable
         if (options.LoadProgressCallback is not null)
         {
             progressHandle = GCHandle.Alloc(options.LoadProgressCallback);
-            progressThunk = static (progress, userData) =>
-            {
-                if (userData == IntPtr.Zero)
-                {
-                    return (byte)1;
-                }
-
-                var callback = GCHandle.FromIntPtr(userData).Target as Action<float>;
-                callback?.Invoke(progress);
-                return (byte)1;
-            };
+            progressThunk = LoadProgressThunk;
 
             native.progress_callback = Marshal.GetFunctionPointerForDelegate(progressThunk);
             native.progress_callback_user_data = GCHandle.ToIntPtr(progressHandle);
