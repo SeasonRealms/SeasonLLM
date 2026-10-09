@@ -703,11 +703,20 @@ jobs:
           # *-macabi build above, for which CMake has no system name to switch on).
           # The behavioral flags mirror the Mac Catalyst job: one static, registry-
           # driven runtime with CPU (M1 baseline), Metal and optional Accelerate BLAS.
+          # Unlike the self-contained Mac Catalyst dylib, this archive is linked into
+          # apps that also carry the qwentts / stable-diffusion / SeasonGGML ggml
+          # runtimes (and every one of those builds with GGML_MAX_NAME=128), so ggml
+          # is compiled with the same override to keep the shared ggml_tensor struct
+          # layout ABI-consistent when several runtimes coexist in one app.
           cmake -S . -B build-ios-device -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES="${ARCH}" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="${MIN_IOS}" \
+            -DCMAKE_C_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_CXX_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJC_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJCXX_FLAGS="-DGGML_MAX_NAME=128" \
             -DCMAKE_BUILD_TYPE="${{ github.event.inputs.configuration }}" \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
@@ -740,11 +749,17 @@ jobs:
           # Same configuration against the iphonesimulator SDK. On Apple Silicon Macs
           # (the only in-scope debug hosts) the simulator runs the arm64 slice, so
           # arm64 is the only simulator architecture that is produced.
+          # GGML_MAX_NAME=128 matches the device slice and the other ggml-based iOS
+          # runtimes (see the device step for the rationale).
           cmake -S . -B build-ios-simulator -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphonesimulator \
             -DCMAKE_OSX_ARCHITECTURES="${ARCH}" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="${MIN_IOS}" \
+            -DCMAKE_C_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_CXX_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJC_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJCXX_FLAGS="-DGGML_MAX_NAME=128" \
             -DCMAKE_BUILD_TYPE="${{ github.event.inputs.configuration }}" \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
@@ -940,12 +955,14 @@ jobs:
             echo "Target triples: arm64-apple-ios${{ github.event.inputs.ios_deployment_target }} (device), arm64-apple-ios${{ github.event.inputs.ios_deployment_target }}-simulator (simulator)"
             echo "Linkage: static (BUILD_SHARED_LIBS=OFF, GGML_BACKEND_DL=OFF), merged into a single libllama.a per slice"
             echo "Enabled backends: cpu (armv8.2-a+dotprod), metal, blas=${{ github.event.inputs.ios_blas }}"
+            echo "GGML_MAX_NAME: 128"
             echo ""
             echo "This build packages a single self-contained llama.cpp runtime for iOS."
             echo "Two slices only, both arm64: ios-arm64 (device) and ios-arm64-simulator (Apple Silicon Macs). One arm64 iOS target does NOT also cover the simulator - device and simulator are distinct Mach-O platforms; no x86_64 simulator slice is produced, Intel Macs are out of scope."
             echo "On iOS both the llama and mtmd P/Invoke bindings are meant to bind as __Internal (unlike the libllama/libmtmd dylibs used on Mac Catalyst), so the app statically links libllama.a via NativeReference (Kind=Static); the merged archive exports the llama, mtmd and ggml entry points from one file."
             echo "Static linkage: llama, mtmd, ggml and every backend are archived into the single libllama.a and registered at runtime by ggml's backend registry; nothing is dlopen'd."
             echo "Self-contained: a complete ggml build is merged in. If several self-contained ggml-based archives (ggml, llama, qwentts, ...) are linked into the same app, keep exactly one ForceLoad=True owner; otherwise the duplicate ggml objects clash at link time."
+            echo "This build compiles ggml with GGML_MAX_NAME=128 (the upstream default is 64) so the ggml_tensor layout matches the other ggml-based runtimes linked into the same app (qwentts, stable-diffusion and SeasonGGML, which all use 128)."
             echo "CPU targets the M1 baseline (armv8.2-a+dotprod), supported by every A12+ device and every Apple Silicon simulator."
             echo "Metal uses GGML_METAL_EMBED_LIBRARY so the shader source travels inside libllama.a; no default.metallib has to be deployed or located in the app bundle."
             echo "BLAS uses Apple's Accelerate framework (GGML_BLAS_VENDOR=Apple), which is available on both iOS devices and simulators."
