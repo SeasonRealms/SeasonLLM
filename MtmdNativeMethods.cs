@@ -6,7 +6,13 @@ namespace Season.LLM;
 
 internal static class MtmdNativeMethods
 {
+#if IOS
+    // On iOS libmtmd is merged into the static libllama.a and binds against the
+    // executable itself via "__Internal".
+    internal const string LibraryName = "__Internal";
+#else
     internal const string LibraryName = "mtmd";
+#endif
 
     internal const int MtmdInputChunkTypeText = 0;
     internal const int MtmdInputChunkTypeImage = 1;

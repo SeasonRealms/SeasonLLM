@@ -6,7 +6,14 @@ namespace Season.LLM;
 
 internal static class NativeMethods
 {
+#if IOS
+    // iOS ships a single statically-linked runtime (libllama.a merges the llama, mtmd
+    // and ggml entry points), so the P/Invoke binds against the executable itself via
+    // "__Internal" - there is no dylib to load at runtime.
+    internal const string LibraryName = "__Internal";
+#else
     internal const string LibraryName = "llama";
+#endif
     internal const int LlamaTokenNull = -1;
 
     [StructLayout(LayoutKind.Sequential)]

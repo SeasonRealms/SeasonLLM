@@ -39,6 +39,18 @@ on:
         options:
           - ON
           - OFF
+      ios_deployment_target:
+        description: "iOS deployment target for the device and simulator builds (forms the arm64-apple-ios<ver> triples)"
+        required: false
+        default: "17.0"
+      ios_blas:
+        description: "Build the Accelerate-backed BLAS backend for iOS"
+        required: false
+        type: choice
+        default: "ON"
+        options:
+          - ON
+          - OFF
       build_target:
         description: "Platform to build (one job per run)"
         required: true
@@ -46,6 +58,7 @@ on:
         default: "maccatalyst"
         options:
           - maccatalyst
+          - ios
           - windows
       build_parallel:
         description: "Parallel build jobs"
@@ -61,8 +74,8 @@ env:
 
 jobs:
   build-windows:
-    # Runs only when build_target is windows; build-maccatalyst is gated the same way,
-    # so exactly one build job executes per workflow run.
+    # Runs only when build_target is windows; every other build job is gated the same
+    # way, so exactly one build job executes per workflow run.
     if: github.event.inputs.build_target == 'windows'
     runs-on: windows-2022
     timeout-minutes: 240
@@ -331,8 +344,8 @@ jobs:
           if-no-files-found: error
 
   build-maccatalyst:
-    # Runs only when build_target is maccatalyst; build-windows is gated the same way,
-    # so exactly one build job executes per workflow run.
+    # Runs only when build_target is maccatalyst; every other build job is gated the
+    # same way, so exactly one build job executes per workflow run.
     if: github.event.inputs.build_target == 'maccatalyst'
     # Apple Silicon only: macos-15 is already arm64, so this is a native build.
     # Intel Macs (x86_64 / maccatalyst-x64) are deliberately not produced - see the
@@ -621,6 +634,350 @@ jobs:
           cat "$manifest"
 
       - name: Upload Mac Catalyst artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-llama-${{ env.RID }}-multi-backend-${{ github.event.inputs.configuration }}
+          path: out/runtimes/${{ env.RID }}/native/multi-backend/
+          if-no-files-found: error
+
+  build-ios:
+    # Runs only when build_target is ios; every other build job is gated the same
+    # way, so exactly one build job executes per workflow run.
+    if: github.event.inputs.build_target == 'ios'
+    # Apple Silicon only (same policy as the Mac Catalyst job): macos-15 is already
+    # arm64, so both slices are native builds. A single "arm64" iOS target does NOT
+    # also cover the simulator - device and simulator are distinct Mach-O platforms
+    # (LC_BUILD_VERSION reports IOS vs IOSSIMULATOR) built against different SDKs, so
+    # each needs its own compile. With Intel Macs out of scope the complete matrix is
+    # exactly two slices: device arm64 + simulator arm64; no x86_64 simulator slice is
+    # produced.
+    runs-on: macos-15
+    timeout-minutes: 240
+
+    env:
+      RID: ios-arm64
+      ARCH: arm64
+      MIN_IOS: ${{ github.event.inputs.ios_deployment_target }}
+      ENABLE_BLAS: ${{ github.event.inputs.ios_blas }}
+
+    steps:
+      - name: Checkout SeasonRealms/llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LLAMA_REPO }}
+          ref: ${{ github.event.inputs.llama_ref }}
+          submodules: false
+
+      - name: Replace ggml with SeasonRealms fork
+        run: |
+          set -euo pipefail
+
+          if [ -d ggml ]; then
+            rm -rf ggml
+          fi
+
+          git clone "https://github.com/${{ env.GGML_REPO }}.git" ggml
+          git -C ggml fetch --depth 1 origin "${{ github.event.inputs.ggml_ref }}"
+          git -C ggml checkout FETCH_HEAD
+          git -C ggml rev-parse HEAD
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Ninja
+        run: |
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew install ninja
+          fi
+          ninja --version
+
+      - name: Configure + build (iOS device arm64)
+        run: |
+          set -euo pipefail
+
+          # CMAKE_SYSTEM_NAME=iOS is CMake's first-class iOS cross-compilation mode:
+          # it selects the iphoneos SDK, the -mios-version-min flag and the arm64
+          # target triple, so no manual -target/-isysroot flags are needed (unlike the
+          # *-macabi build above, for which CMake has no system name to switch on).
+          # The behavioral flags mirror the Mac Catalyst job: one static, registry-
+          # driven runtime with CPU (M1 baseline), Metal and optional Accelerate BLAS.
+          # Unlike the self-contained Mac Catalyst dylib, this archive is linked into
+          # apps that also carry the qwentts / stable-diffusion / SeasonGGML ggml
+          # runtimes (and every one of those builds with GGML_MAX_NAME=128), so ggml
+          # is compiled with the same override to keep the shared ggml_tensor struct
+          # layout ABI-consistent when several runtimes coexist in one app.
+          cmake -S . -B build-ios-device -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES="${ARCH}" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${MIN_IOS}" \
+            -DCMAKE_C_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_CXX_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJC_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJCXX_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_BUILD_TYPE="${{ github.event.inputs.configuration }}" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_APP=OFF \
+            -DLLAMA_BUILD_MTMD=ON \
+            -DLLAMA_OPENSSL=OFF \
+            -DGGML_BACKEND_DL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=ON \
+            -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
+            -DGGML_ACCELERATE=ON \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_METAL_NDEBUG=ON \
+            -DGGML_BLAS="${ENABLE_BLAS}" \
+            -DGGML_BLAS_VENDOR=Apple \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_VULKAN=OFF
+
+          cmake --build build-ios-device --parallel "${{ github.event.inputs.build_parallel }}"
+
+      - name: Configure + build (iOS simulator arm64)
+        run: |
+          set -euo pipefail
+
+          # Same configuration against the iphonesimulator SDK. On Apple Silicon Macs
+          # (the only in-scope debug hosts) the simulator runs the arm64 slice, so
+          # arm64 is the only simulator architecture that is produced.
+          # GGML_MAX_NAME=128 matches the device slice and the other ggml-based iOS
+          # runtimes (see the device step for the rationale).
+          cmake -S . -B build-ios-simulator -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DCMAKE_OSX_ARCHITECTURES="${ARCH}" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${MIN_IOS}" \
+            -DCMAKE_C_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_CXX_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJC_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_OBJCXX_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_BUILD_TYPE="${{ github.event.inputs.configuration }}" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_APP=OFF \
+            -DLLAMA_BUILD_MTMD=ON \
+            -DLLAMA_OPENSSL=OFF \
+            -DGGML_BACKEND_DL=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=ON \
+            -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
+            -DGGML_ACCELERATE=ON \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_METAL_NDEBUG=ON \
+            -DGGML_BLAS="${ENABLE_BLAS}" \
+            -DGGML_BLAS_VENDOR=Apple \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_VULKAN=OFF
+
+          cmake --build build-ios-simulator --parallel "${{ github.event.inputs.build_parallel }}"
+
+      - name: Merge static archives into a single libllama.a per slice
+        run: |
+          set -euo pipefail
+
+          # With BUILD_SHARED_LIBS=OFF and GGML_BACKEND_DL=OFF llama, mtmd and every
+          # ggml piece are separate .a files. Merge each slice's archives into ONE
+          # libllama.a with libtool: on iOS both the "llama" and "mtmd" P/Invoke
+          # bindings are meant to bind as "__Internal" and resolve against this single
+          # archive - no re-export shim like the Mac Catalyst libmtmd.dylib is needed,
+          # because there is nothing to dlopen and both bindings share one copy of the
+          # llama/ggml state by construction.
+          merge_slice() {
+            local build_dir="$1"
+            local out_dir="$2"
+            mkdir -p "$out_dir"
+
+            local archives=""
+            for a in libllama.a libggml-base.a libggml.a libggml-cpu.a libggml-metal.a libggml-blas.a; do
+              found="$(find "$build_dir" -name "$a" | head -n1)"
+              if [ -n "$found" ]; then
+                archives="${archives} ${found}"
+              fi
+            done
+
+            # mtmd (multimodal helpers) is explicitly enabled via LLAMA_BUILD_MTMD so
+            # its objects are merged too and the "mtmd" binding resolves against the
+            # same archive as "llama".
+            local mtmd
+            mtmd="$(find "$build_dir" -name "libmtmd*.a" | head -n1)"
+            if [ -n "$mtmd" ]; then
+              archives="${archives} ${mtmd}"
+            else
+              echo "mtmd archive is missing despite LLAMA_BUILD_MTMD=ON in ${build_dir}" >&2
+              exit 1
+            fi
+
+            # llama and the ggml core archives are mandatory; the backend archives
+            # depend on the enabled backends, so only their absence for a required
+            # backend would surface later.
+            for req in libllama.a libggml-base.a libggml.a libggml-cpu.a libggml-metal.a; do
+              if ! find "$build_dir" -name "$req" | grep -q .; then
+                echo "Required static archive is missing in ${build_dir}: $req" >&2
+                exit 1
+              fi
+            done
+
+            # shellcheck disable=SC2086
+            libtool -static -o "${out_dir}/libllama.a" ${archives}
+          }
+
+          rm -rf merged
+          merge_slice build-ios-device merged/device
+          merge_slice build-ios-simulator merged/simulator
+
+      - name: Create libllama.xcframework
+        run: |
+          set -euo pipefail
+
+          # One xcframework carries both slices; xcodebuild classifies each library by
+          # its LC_BUILD_VERSION platform tag (ios-arm64 / ios-arm64-simulator), which
+          # also implicitly re-validates that the device and simulator builds did not
+          # get mixed up.
+          xcodebuild -create-xcframework \
+            -library merged/device/libllama.a \
+            -library merged/simulator/libllama.a \
+            -output merged/libllama.xcframework
+
+      - name: Verify slices
+        run: |
+          set -euo pipefail
+
+          verify_slice() {
+            local lib="$1"
+            local probe_root="$2"
+            local platform_tag="$3"
+
+            local archInfo
+            archInfo="$(lipo -info "$lib")"
+            if ! echo "$archInfo" | grep -q "${ARCH}"; then
+              echo "Missing ${ARCH} slice in ${lib}: ${archInfo}" >&2
+              exit 1
+            fi
+            if echo "$archInfo" | grep -q 'x86_64\|i386'; then
+              echo "Unexpected Intel slice in ${lib}: ${archInfo}" >&2
+              exit 1
+            fi
+
+            # The LC_BUILD_VERSION platform tag must say IOS (device) or IOSSIMULATOR
+            # (simulator; anchored so "IOS" cannot match inside "IOSSIMULATOR"). A
+            # plain macOS build or a device/simulator mix-up links on the runner but
+            # breaks the app build downstream.
+            local probe
+            probe="$(find "$probe_root" -name "*.o" | head -n1)"
+            if [ -z "$probe" ]; then
+              echo "No object file under ${probe_root} to verify the platform tag" >&2
+              exit 1
+            fi
+            if ! xcrun vtool -show-build-version "$probe" | grep -q " ${platform_tag}$"; then
+              echo "Platform tag mismatch in ${lib} (expected ${platform_tag}):" >&2
+              xcrun vtool -show-build-version "$probe" >&2
+              exit 1
+            fi
+          }
+
+          verify_slice merged/device/libllama.a build-ios-device IOS
+          verify_slice merged/simulator/libllama.a build-ios-simulator IOSSIMULATOR
+
+          # The merged archives must export the entry points SeasonLLM P/Invokes
+          # through both its "llama" and "mtmd" bindings; a dropped backend object or
+          # an unresolved symbol shows up as a missing export here. Read nm once into
+          # a variable and match with a here-string: piping nm into grep -q lets grep
+          # close the pipe on the first match, which makes llvm-nm abort with "Broken
+          # pipe" and, under set -o pipefail, fails the whole pipeline even though the
+          # symbol was found.
+          for lib in merged/device/libllama.a merged/simulator/libllama.a; do
+            nmOut="$(nm -g "$lib")"
+            for sym in _llama_backend_init _llama_model_default_params _llama_context_default_params _llama_sampler_chain_default_params _mtmd_default_marker _mtmd_init_from_file; do
+              if ! grep -q " ${sym}$" <<< "$nmOut"; then
+                echo "Merged library does not export ${sym}: ${lib}" >&2
+                exit 1
+              fi
+            done
+          done
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+
+          out="out/runtimes/${RID}/native/multi-backend"
+          mkdir -p "$out"
+
+          cp LICENSE "$out/llama.cpp.txt"
+          if [ -f "ggml/LICENSE" ]; then
+            cp "ggml/LICENSE" "$out/ggml.txt"
+          fi
+
+          for header in llama.h llama-cpp.h; do
+            if [ -f "include/${header}" ]; then
+              cp "include/${header}" "$out/"
+            fi
+          done
+
+          rm -rf "$out/libllama.xcframework"
+          cp -R merged/libllama.xcframework "$out/libllama.xcframework"
+
+          if [ ! -f "$out/libllama.xcframework/ios-arm64/libllama.a" ] ||
+             [ ! -f "$out/libllama.xcframework/ios-arm64-simulator/libllama.a" ]; then
+            echo "Required llama.cpp runtime is missing from the xcframework" >&2
+            ls -R "$out/libllama.xcframework" >&2
+            exit 1
+          fi
+
+          # Record the archive checksums so they can be verified after download.
+          # Transferring binaries through text-mode channels (sync tools, text
+          # editors, some file shares) corrupts the Mach-O headers; this is how a
+          # downstream user detects that before it reaches a device.
+          devSha=$(shasum -a 256 "$out/libllama.xcframework/ios-arm64/libllama.a" | awk '{print $1}')
+          simSha=$(shasum -a 256 "$out/libllama.xcframework/ios-arm64-simulator/libllama.a" | awk '{print $1}')
+
+          manifest="$out/README.txt"
+          {
+            echo "Platform: ${RID} (multi-backend xcframework carrying the device and arm64-simulator slices)"
+            echo "Configuration: ${{ github.event.inputs.configuration }}"
+            echo "LLAMA_REPO: https://github.com/${{ env.LLAMA_REPO }}"
+            echo "LLAMA_REF: ${{ github.event.inputs.llama_ref }}"
+            echo "GGML_REPO: https://github.com/${{ env.GGML_REPO }}"
+            echo "GGML_REF: ${{ github.event.inputs.ggml_ref }}"
+            echo "Target triples: arm64-apple-ios${{ github.event.inputs.ios_deployment_target }} (device), arm64-apple-ios${{ github.event.inputs.ios_deployment_target }}-simulator (simulator)"
+            echo "Linkage: static (BUILD_SHARED_LIBS=OFF, GGML_BACKEND_DL=OFF), merged into a single libllama.a per slice"
+            echo "Enabled backends: cpu (armv8.2-a+dotprod), metal, blas=${{ github.event.inputs.ios_blas }}"
+            echo "GGML_MAX_NAME: 128"
+            echo ""
+            echo "This build packages a single self-contained llama.cpp runtime for iOS."
+            echo "Two slices only, both arm64: ios-arm64 (device) and ios-arm64-simulator (Apple Silicon Macs). One arm64 iOS target does NOT also cover the simulator - device and simulator are distinct Mach-O platforms; no x86_64 simulator slice is produced, Intel Macs are out of scope."
+            echo "On iOS both the llama and mtmd P/Invoke bindings are meant to bind as __Internal (unlike the libllama/libmtmd dylibs used on Mac Catalyst), so the app statically links libllama.a via NativeReference (Kind=Static); the merged archive exports the llama, mtmd and ggml entry points from one file."
+            echo "Static linkage: llama, mtmd, ggml and every backend are archived into the single libllama.a and registered at runtime by ggml's backend registry; nothing is dlopen'd."
+            echo "Self-contained: a complete ggml build is merged in. If several self-contained ggml-based archives (ggml, llama, qwentts, ...) are linked into the same app, keep exactly one ForceLoad=True owner; otherwise the duplicate ggml objects clash at link time."
+            echo "This build compiles ggml with GGML_MAX_NAME=128 (the upstream default is 64) so the ggml_tensor layout matches the other ggml-based runtimes linked into the same app (qwentts, stable-diffusion and SeasonGGML, which all use 128)."
+            echo "CPU targets the M1 baseline (armv8.2-a+dotprod), supported by every A12+ device and every Apple Silicon simulator."
+            echo "Metal uses GGML_METAL_EMBED_LIBRARY so the shader source travels inside libllama.a; no default.metallib has to be deployed or located in the app bundle."
+            echo "BLAS uses Apple's Accelerate framework (GGML_BLAS_VENDOR=Apple), which is available on both iOS devices and simulators."
+            echo "CUDA and Vulkan are unavailable on iOS and are explicitly disabled."
+            echo "Command line tools (llama-cli, llama-server) are not built for iOS: this artifact is the native library consumed by SeasonLLM through P/Invoke."
+            echo ""
+            echo "libllama.a sha256 (ios-arm64): ${devSha}"
+            echo "libllama.a sha256 (ios-arm64-simulator): ${simSha}"
+            echo "Artifact contents:"
+            (cd "$out" && find . | sort)
+          } > "$manifest"
+
+          cat "$manifest"
+
+      - name: Upload iOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: stable-llama-${{ env.RID }}-multi-backend-${{ github.event.inputs.configuration }}
