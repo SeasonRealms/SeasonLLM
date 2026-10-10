@@ -120,6 +120,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path build | Out-Null
           Set-Location build
 
+          # Both UI paths are disabled explicitly (LLAMA_BUILD_UI=OFF and
+          # LLAMA_USE_PREBUILT_UI=OFF below). LLAMA_BUILD_UI=OFF alone still lets
+          # the llama-ui-assets target download a prebuilt dist at build time from
+          # the moving ggml-org/llama-ui HF bucket (LLAMA_USE_PREBUILT_UI defaults
+          # to ON), and that dist no longer ships loading.html which this
+          # llama.cpp snapshot's llama-ui-embed still hard-requires.
           $cmakeArgs = @(
             '..',
             '-G', 'Ninja',
@@ -134,6 +140,7 @@ jobs:
             '-DLLAMA_BUILD_SERVER=ON',
             '-DLLAMA_BUILD_APP=ON',
             '-DLLAMA_BUILD_UI=OFF',
+            '-DLLAMA_USE_PREBUILT_UI=OFF',
             '-DLLAMA_OPENSSL=OFF',
             '-DGGML_BACKEND_DL=ON',
             '-DGGML_NATIVE=OFF',
@@ -330,6 +337,8 @@ jobs:
             "",
             "This build packages llama.cpp for win-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder.",
             "",
+            "The builds carry no embedded web UI (LLAMA_BUILD_UI=OFF, LLAMA_USE_PREBUILT_UI=OFF: no npm build and no prebuilt UI download); llama-server serves the HTTP API only.",
+            "",
             "Artifact contents:"
           ) | Set-Content -Path $manifest -Encoding ascii
 
@@ -389,6 +398,12 @@ jobs:
 
       - name: Configure CMake
         run: |
+          # Both UI paths are disabled explicitly (LLAMA_BUILD_UI=OFF and
+          # LLAMA_USE_PREBUILT_UI=OFF below). LLAMA_BUILD_UI=OFF alone still lets
+          # the llama-ui-assets target download a prebuilt dist at build time from
+          # the moving ggml-org/llama-ui HF bucket (LLAMA_USE_PREBUILT_UI defaults
+          # to ON), and that dist no longer ships loading.html which this
+          # llama.cpp snapshot's llama-ui-embed still hard-requires.
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE="${{ github.event.inputs.configuration }}" \
             -DBUILD_SHARED_LIBS=ON \
@@ -398,6 +413,7 @@ jobs:
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_APP=ON \
             -DLLAMA_BUILD_UI=OFF \
+            -DLLAMA_USE_PREBUILT_UI=OFF \
             -DLLAMA_OPENSSL=OFF \
             -DGGML_BACKEND_DL=ON \
             -DGGML_NATIVE=OFF \
@@ -457,6 +473,8 @@ jobs:
             echo "CUDA Toolkit version (build time only): ${{ github.event.inputs.cuda_version }}"
             echo ""
             echo "This build packages llama.cpp for linux-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder."
+            echo ""
+            echo "The builds carry no embedded web UI (LLAMA_BUILD_UI=OFF, LLAMA_USE_PREBUILT_UI=OFF: no npm build and no prebuilt UI download); llama-server serves the HTTP API only."
             echo ""
             echo "CUDA and cuDNN runtimes are NOT bundled: install CUDA 12.x system-wide for the CUDA backend."
             echo ""
