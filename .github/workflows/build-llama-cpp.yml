@@ -20,11 +20,11 @@ on:
         required: true
         default: "master"
       cuda_version:
-        description: "CUDA Toolkit version, aligned with SeasonTTS"
+        description: "CUDA Toolkit version for the Windows and Linux builds, aligned with SeasonTTS"
         required: false
         default: "12.8.1"
       cuda_architectures:
-        description: "CUDA architectures for the Windows CUDA build"
+        description: "CUDA architectures for the Windows and Linux CUDA builds"
         required: false
         default: "75-virtual;80-real;86-real;89-real;90-virtual"
       maccatalyst_min_ios:
@@ -60,6 +60,7 @@ on:
           - maccatalyst
           - ios
           - windows
+          - linux
       build_parallel:
         description: "Parallel build jobs"
         required: false
@@ -341,6 +342,133 @@ jobs:
         with:
           name: stable-llama-win-x64-multi-backend-${{ github.event.inputs.configuration }}
           path: out/runtimes/win-x64/native/multi-backend/
+          if-no-files-found: error
+
+  build-linux:
+    # Runs only when build_target is linux; every other build job is gated the
+    # same way, so exactly one build job executes per workflow run.
+    if: github.event.inputs.build_target == 'linux'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout SeasonRealms/llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LLAMA_REPO }}
+          ref: ${{ github.event.inputs.llama_ref }}
+          submodules: false
+
+      - name: Replace ggml with SeasonRealms fork
+        run: |
+          rm -rf ggml
+          git clone "https://github.com/${{ env.GGML_REPO }}.git" ggml
+          git -C ggml fetch --depth 1 origin "${{ github.event.inputs.ggml_ref }}"
+          git -C ggml checkout FETCH_HEAD
+          git -C ggml rev-parse HEAD
+
+      # Same build-time toolchain as the Windows job: Vulkan SDK for ggml-vulkan
+      # (provides glslc) and CUDA Toolkit for ggml-cuda (nvcc + cudart + cuBLAS).
+      # The toolkit is build-time only: CUDA runtimes are NOT bundled into the
+      # artifact (mirroring Windows, where cudacudnn-runtime is packaged
+      # separately). Users install CUDA 12.x system-wide per the documented
+      # guidance, so no CUDA .so files are collected.
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+
+      # Linux sub-package names get the "cuda-" prefix added automatically
+      # (nvcc -> cuda-nvcc), while the cuBLAS packages live outside that
+      # namespace and must be requested through non-cuda-sub-packages.
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "${{ github.event.inputs.cuda_version }}"
+          method: network
+          sub-packages: '["nvcc", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE="${{ github.event.inputs.configuration }}" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_APP=ON \
+            -DLLAMA_BUILD_UI=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_AVX2=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_VULKAN=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ github.event.inputs.cuda_architectures }}"
+
+      - name: Build
+        run: |
+          cmake --build build --config "${{ github.event.inputs.configuration }}" --parallel "${{ github.event.inputs.build_parallel }}"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          out="out/runtimes/linux-x64/native/multi-backend"
+          mkdir -p "$out"
+
+          if [ ! -d build/bin ]; then
+            echo "build/bin not found" >&2
+            exit 1
+          fi
+
+          cp LICENSE "$out/llama.cpp.txt"
+          if [ -f ggml/LICENSE ]; then
+            cp ggml/LICENSE "$out/ggml.txt"
+          fi
+
+          for header in include/llama.h include/llama-cpp.h; do
+            if [ -f "$header" ]; then
+              cp "$header" "$out"
+            fi
+          done
+
+          # Everything the build placed in build/bin: shared libraries and the
+          # llama-cli / llama-server tools, mirroring the Windows job. -L
+          # dereferences the SONAME symlink chains so the artifact carries real
+          # files under every name that dlopen and the linker-recorded SONAMEs
+          # look for at runtime.
+          cp -RL build/bin/. "$out/"
+
+          for name in libllama.so libggml.so libggml-base.so libggml-cpu.so libggml-cuda.so libggml-vulkan.so; do
+            if [ ! -f "$out/$name" ]; then
+              echo "Required llama.cpp runtime is missing: $name" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "LLAMA_REPO: https://github.com/${{ env.LLAMA_REPO }}"
+            echo "LLAMA_REF: ${{ github.event.inputs.llama_ref }}"
+            echo "Enabled backends: cpu-avx2, cuda12, vulkan"
+            echo "Configuration: ${{ github.event.inputs.configuration }}"
+            echo "GGML_REPO: ${{ env.GGML_REPO }}"
+            echo "GGML_REF: ${{ github.event.inputs.ggml_ref }}"
+            echo "CUDA Toolkit version (build time only): ${{ github.event.inputs.cuda_version }}"
+            echo ""
+            echo "This build packages llama.cpp for linux-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder."
+            echo ""
+            echo "CUDA and cuDNN runtimes are NOT bundled: install CUDA 12.x system-wide for the CUDA backend."
+            echo ""
+            echo "Artifact contents:"
+            (cd "$out" && ls -1 | sort)
+          } > "$out/README.txt"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-llama-linux-x64-multi-backend-${{ github.event.inputs.configuration }}
+          path: out/runtimes/linux-x64/native/multi-backend/
           if-no-files-found: error
 
   build-maccatalyst:
