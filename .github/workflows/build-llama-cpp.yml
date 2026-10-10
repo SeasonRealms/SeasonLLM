@@ -126,13 +126,18 @@ jobs:
           # the moving ggml-org/llama-ui HF bucket (LLAMA_USE_PREBUILT_UI defaults
           # to ON), and that dist no longer ships loading.html which this
           # llama.cpp snapshot's llama-ui-embed still hard-requires.
+          #
+          # GGML_MAX_NAME=128 overrides the upstream default (64) so the ggml_tensor
+          # layout matches the other ggml runtimes linked into the same app
+          # (SeasonGGML, stable-diffusion and qwentts all build with 128).
           $cmakeArgs = @(
             '..',
             '-G', 'Ninja',
             '-DCMAKE_C_COMPILER=cl.exe',
             '-DCMAKE_CXX_COMPILER=cl.exe',
             "-DCMAKE_BUILD_TYPE=${{ github.event.inputs.configuration }}",
-            '-DCMAKE_CXX_FLAGS=/bigobj',
+            '-DCMAKE_C_FLAGS=/DGGML_MAX_NAME=128',
+            '-DCMAKE_CXX_FLAGS=/bigobj /DGGML_MAX_NAME=128',
             '-DBUILD_SHARED_LIBS=ON',
             '-DLLAMA_BUILD_TESTS=OFF',
             '-DLLAMA_BUILD_EXAMPLES=OFF',
@@ -148,7 +153,7 @@ jobs:
             '-DGGML_CUDA=ON',
             '-DGGML_VULKAN=ON',
             '-DGGML_CUDA_CUB_3DOT2=ON',
-            '-DCMAKE_CUDA_FLAGS=-Xcudafe "--diag_suppress=177" -Xcudafe "--diag_suppress=550"',
+            '-DCMAKE_CUDA_FLAGS=-Xcudafe "--diag_suppress=177" -Xcudafe "--diag_suppress=550" /DGGML_MAX_NAME=128',
             '-DCMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.cuda_architectures }}'
           )
 
@@ -333,6 +338,7 @@ jobs:
             "Configuration: ${{ github.event.inputs.configuration }}",
             "GGML_REPO: ${{ env.GGML_REPO }}",
             "GGML_REF: ${{ github.event.inputs.ggml_ref }}",
+            "GGML_MAX_NAME: 128",
             "CUDA Toolkit version: ${{ github.event.inputs.cuda_version }}",
             "",
             "This build packages llama.cpp for win-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder.",
@@ -404,8 +410,13 @@ jobs:
           # the moving ggml-org/llama-ui HF bucket (LLAMA_USE_PREBUILT_UI defaults
           # to ON), and that dist no longer ships loading.html which this
           # llama.cpp snapshot's llama-ui-embed still hard-requires.
+          # GGML_MAX_NAME=128 overrides the upstream default (64) so the ggml_tensor
+          # layout matches the other ggml runtimes linked into the same app
+          # (SeasonGGML, stable-diffusion and qwentts all build with 128).
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE="${{ github.event.inputs.configuration }}" \
+            -DCMAKE_C_FLAGS="-DGGML_MAX_NAME=128" \
+            -DCMAKE_CXX_FLAGS="-DGGML_MAX_NAME=128" \
             -DBUILD_SHARED_LIBS=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -421,6 +432,7 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_VULKAN=ON \
             -DGGML_CUDA_CUB_3DOT2=ON \
+            -DCMAKE_CUDA_FLAGS="-DGGML_MAX_NAME=128" \
             -DCMAKE_CUDA_ARCHITECTURES="${{ github.event.inputs.cuda_architectures }}"
 
       - name: Build
@@ -470,6 +482,7 @@ jobs:
             echo "Configuration: ${{ github.event.inputs.configuration }}"
             echo "GGML_REPO: ${{ env.GGML_REPO }}"
             echo "GGML_REF: ${{ github.event.inputs.ggml_ref }}"
+            echo "GGML_MAX_NAME: 128"
             echo "CUDA Toolkit version (build time only): ${{ github.event.inputs.cuda_version }}"
             echo ""
             echo "This build packages llama.cpp for linux-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder."
@@ -559,6 +572,11 @@ jobs:
           CAT_FLAGS="-target ${TRIPLE}"
           CAT_FLAGS="${CAT_FLAGS} -isystem ${SDK_PATH}/System/iOSSupport/usr/include"
           CAT_FLAGS="${CAT_FLAGS} -iframework ${SDK_PATH}/System/iOSSupport/System/Library/Frameworks"
+
+          # GGML_MAX_NAME=128 overrides the upstream default (64) so the ggml_tensor
+          # layout matches the other ggml runtimes linked into the same app
+          # (SeasonGGML, stable-diffusion and qwentts all build with 128).
+          CAT_FLAGS="${CAT_FLAGS} -DGGML_MAX_NAME=128"
 
           LINK_FLAGS="-target ${TRIPLE}"
           LINK_FLAGS="${LINK_FLAGS} -L${SDK_PATH}/System/iOSSupport/usr/lib"
@@ -756,6 +774,7 @@ jobs:
             echo "LLAMA_REF: ${{ github.event.inputs.llama_ref }}"
             echo "GGML_REPO: https://github.com/${{ env.GGML_REPO }}"
             echo "GGML_REF: ${{ github.event.inputs.ggml_ref }}"
+            echo "GGML_MAX_NAME: 128"
             echo "Configuration: ${{ github.event.inputs.configuration }}"
             echo "RID: ${RID}"
             echo "Target triple: ${ARCH}-apple-ios${{ github.event.inputs.maccatalyst_min_ios }}-macabi"
