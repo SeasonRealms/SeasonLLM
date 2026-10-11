@@ -101,10 +101,10 @@ public static class SeasonLLM
 
     internal static void EnsureSupported()
     {
-        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacCatalyst() && !OperatingSystem.IsIOS())
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacCatalyst() && !OperatingSystem.IsIOS() && !OperatingSystem.IsLinux())
         {
             throw new PlatformNotSupportedException(
-                "SeasonLLM currently ships llama.cpp native binaries only for Windows, Mac Catalyst (Apple Silicon) and iOS.");
+                "SeasonLLM currently ships llama.cpp native binaries only for Windows, Mac Catalyst (Apple Silicon), iOS, and Linux.");
         }
 
         // The Mac Catalyst artifacts are pure arm64 slices, so on an Intel Mac - or under
