@@ -12,12 +12,12 @@ public static class SeasonLLM
     private static NativeMethods.GgmlLogCallback? s_logThunk;
     private static Action<SeasonLlmLogLevel, string>? s_logCallback;
 
-    public static bool IsSupported =>
-        OperatingSystem.IsWindows() ||
-        // IsIOS() can report true on Mac Catalyst, so the guard keeps the arm64-only
-        // Mac Catalyst clause below in charge there.
-        (OperatingSystem.IsIOS() && !OperatingSystem.IsMacCatalyst()) ||
-        (OperatingSystem.IsMacCatalyst() && RuntimeInformation.ProcessArchitecture == Architecture.Arm64);
+    //public static bool IsSupported =>
+    //    OperatingSystem.IsWindows() ||
+    //    // IsIOS() can report true on Mac Catalyst, so the guard keeps the arm64-only
+    //    // Mac Catalyst clause below in charge there.
+    //    (OperatingSystem.IsIOS() && !OperatingSystem.IsMacCatalyst()) ||
+    //    (OperatingSystem.IsMacCatalyst() && RuntimeInformation.ProcessArchitecture == Architecture.Arm64);
 
     public static string SystemInfo
     {
@@ -101,20 +101,20 @@ public static class SeasonLLM
 
     internal static void EnsureSupported()
     {
-        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacCatalyst() && !OperatingSystem.IsIOS() && !OperatingSystem.IsLinux())
-        {
-            throw new PlatformNotSupportedException(
-                "SeasonLLM currently ships llama.cpp native binaries only for Windows, Mac Catalyst (Apple Silicon), iOS, and Linux.");
-        }
+        //if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacCatalyst() && !OperatingSystem.IsIOS() && !OperatingSystem.IsLinux())
+        //{
+        //    throw new PlatformNotSupportedException(
+        //        "SeasonLLM currently ships llama.cpp native binaries only for Windows, Mac Catalyst (Apple Silicon), iOS, and Linux.");
+        //}
 
         // The Mac Catalyst artifacts are pure arm64 slices, so on an Intel Mac - or under
         // Rosetta - the dylibs cannot even be opened. Report that reason instead of
         // letting the first P/Invoke surface a bare DllNotFoundException.
-        if (OperatingSystem.IsMacCatalyst() && RuntimeInformation.ProcessArchitecture != Architecture.Arm64)
-        {
-            throw new PlatformNotSupportedException(
-                "SeasonLLM ships Mac Catalyst llama.cpp native binaries for Apple Silicon (arm64) only; " +
-                $"this process runs as {RuntimeInformation.ProcessArchitecture}.");
-        }
+        //if (OperatingSystem.IsMacCatalyst() && RuntimeInformation.ProcessArchitecture != Architecture.Arm64)
+        //{
+        //    throw new PlatformNotSupportedException(
+        //        "SeasonLLM ships Mac Catalyst llama.cpp native binaries for Apple Silicon (arm64) only; " +
+        //        $"this process runs as {RuntimeInformation.ProcessArchitecture}.");
+        //}
     }
 }
