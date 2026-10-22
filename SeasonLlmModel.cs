@@ -39,15 +39,17 @@ public sealed class SeasonLlmModel : IDisposable
         using var strings = new Utf8StringArena();
         using var backendDevices = global::Season.GGML.GGML.CreateBackendSelection(options.Backend, options.ParamsBackend);
 
-        var native = NativeMethods.llama_model_default_params();
-        native.devices = backendDevices?.Pointer ?? IntPtr.Zero;
-        native.n_gpu_layers = options.GpuLayers;
-        native.main_gpu = options.MainGpu;
-        native.use_mmap = NativeMethods.ToNativeBool(options.UseMmap);
-        native.use_mlock = NativeMethods.ToNativeBool(options.UseMlock);
-        native.use_direct_io = NativeMethods.ToNativeBool(options.UseDirectIo);
-        native.check_tensors = NativeMethods.ToNativeBool(options.CheckTensors);
-        native.vocab_only = NativeMethods.ToNativeBool(options.VocabularyOnly);
+        // When the requested Metal device is missing from the selection (unsupported
+        // GPU or failed Metal initialisation), CreateBackendSelection has already
+        // fallen back to CPU: offloading layers would then only target host memory,
+        // so the model is loaded with the CPU layer count instead.
+        var metalRequested = global::Season.GGML.GGML.IsMetalBackend(options.Backend) ||
+                             global::Season.GGML.GGML.IsMetalBackend(options.ParamsBackend);
+        var metalSelected = backendDevices is not null &&
+                            backendDevices.Names.Any(global::Season.GGML.GGML.IsMetalBackend);
+        var cpuFallback = metalRequested && !metalSelected;
+        var gpuLayers = cpuFallback ? 0 : options.GpuLayers;
+        string[]? resolvedBackendNames = null;
 
         NativeMethods.NativeProgressCallback? progressThunk = null;
         GCHandle progressHandle = default;
@@ -56,14 +58,26 @@ public sealed class SeasonLlmModel : IDisposable
         {
             progressHandle = GCHandle.Alloc(options.LoadProgressCallback);
             progressThunk = LoadProgressThunk;
-
-            native.progress_callback = Marshal.GetFunctionPointerForDelegate(progressThunk);
-            native.progress_callback_user_data = GCHandle.ToIntPtr(progressHandle);
         }
 
         try
         {
-            _handle = NativeMethods.llama_model_load_from_file(strings.Add(options.ModelPath), native);
+            _handle = LoadModel(options, strings, backendDevices, gpuLayers, progressThunk, progressHandle);
+
+            if (_handle == IntPtr.Zero && metalSelected)
+            {
+                // The Metal device reached the registry but the model still failed to
+                // load on it (for example a pipeline compilation failure). Retry once
+                // on the CPU so a broken Metal runtime does not make the model unusable.
+                System.Diagnostics.Debug.WriteLine(
+                    "[SeasonLLM] Model load on Metal failed; retrying with the CPU backend.");
+
+                cpuFallback = true;
+
+                using var cpuDevices = global::Season.GGML.GGML.CreateBackendSelection("cpu", options.ParamsBackend);
+                _handle = LoadModel(options, strings, cpuDevices, 0, progressThunk, progressHandle);
+                resolvedBackendNames = cpuDevices?.Names.ToArray();
+            }
         }
         finally
         {
@@ -96,12 +110,39 @@ public sealed class SeasonLlmModel : IDisposable
         LoraPath = options.LoraPath;
         LoraScale = options.LoraScale;
         MmprojPath = options.MmprojPath;
-        MmprojUseGpu = options.MmprojUseGpu;
+        MmprojUseGpu = options.MmprojUseGpu && !cpuFallback;
         ImageMinTokens = options.ImageMinTokens;
         ImageMaxTokens = options.ImageMaxTokens;
         Backend = options.Backend;
         ParamsBackend = options.ParamsBackend;
-        ResolvedBackends = backendDevices?.Names.ToArray() ?? [];
+        ResolvedBackends = resolvedBackendNames ?? backendDevices?.Names.ToArray() ?? [];
+    }
+
+    private static IntPtr LoadModel(
+        SeasonLlmModelOptions options,
+        Utf8StringArena strings,
+        global::Season.GGML.GgmlBackendSelection? backendDevices,
+        int gpuLayers,
+        NativeMethods.NativeProgressCallback? progressThunk,
+        GCHandle progressHandle)
+    {
+        var native = NativeMethods.llama_model_default_params();
+        native.devices = backendDevices?.Pointer ?? IntPtr.Zero;
+        native.n_gpu_layers = gpuLayers;
+        native.main_gpu = options.MainGpu;
+        native.use_mmap = NativeMethods.ToNativeBool(options.UseMmap);
+        native.use_mlock = NativeMethods.ToNativeBool(options.UseMlock);
+        native.use_direct_io = NativeMethods.ToNativeBool(options.UseDirectIo);
+        native.check_tensors = NativeMethods.ToNativeBool(options.CheckTensors);
+        native.vocab_only = NativeMethods.ToNativeBool(options.VocabularyOnly);
+
+        if (progressThunk is not null)
+        {
+            native.progress_callback = Marshal.GetFunctionPointerForDelegate(progressThunk);
+            native.progress_callback_user_data = GCHandle.ToIntPtr(progressHandle);
+        }
+
+        return NativeMethods.llama_model_load_from_file(strings.Add(options.ModelPath), native);
     }
 
     public string ModelPath { get; }
