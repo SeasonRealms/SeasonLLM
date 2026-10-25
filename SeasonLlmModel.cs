@@ -11,6 +11,13 @@ public sealed class SeasonLlmModel : IDisposable
     private bool _disposed;
     private int _activeContexts;
 
+    // Contexts are released lazily: a context disposed while a generation is in
+    // flight keeps the model alive until that generation leaves native code.
+    // Freeing the weights underneath it would be a use-after-free, so Dispose()
+    // only requests the release and the last ReturnContext performs it.
+    private readonly object _gate = new();
+    private int _disposeRequested;
+
     // Static thunk with MonoPInvokeCallback: the AOT compiler pre-generates the
     // native-to-managed wrapper. A lambda would need that wrapper JIT-compiled on
     // first use, which aborts aot-only Release builds with
@@ -545,13 +552,37 @@ public sealed class SeasonLlmModel : IDisposable
 
     internal void RentContext()
     {
-        ThrowIfDisposed();
-        Interlocked.Increment(ref _activeContexts);
+        lock (_gate)
+        {
+            if (_disposeRequested != 0)
+            {
+                throw new ObjectDisposedException(nameof(SeasonLlmModel));
+            }
+
+            _activeContexts++;
+        }
     }
 
     internal void ReturnContext()
     {
-        Interlocked.Decrement(ref _activeContexts);
+        bool free;
+
+        lock (_gate)
+        {
+            _activeContexts--;
+
+            free = _activeContexts == 0 && _disposeRequested != 0 && !_disposed;
+
+            if (free)
+            {
+                _disposed = true;
+            }
+        }
+
+        if (free)
+        {
+            FreeNative();
+        }
     }
 
     internal void ApplyConfiguredLora(IntPtr contextHandle)
@@ -587,20 +618,42 @@ public sealed class SeasonLlmModel : IDisposable
         return builder.ToString();
     }
 
+    /// <summary>
+    /// Requests the release of the weights and the LoRA adapter. Contexts that are
+    /// still running keep them loaded and free them on their way out; the request
+    /// only prevents new contexts from being created.
+    /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        bool free;
+
+        lock (_gate)
+        {
+            if (_disposeRequested != 0)
+            {
+                return;
+            }
+
+            _disposeRequested = 1;
+            free = _activeContexts == 0 && !_disposed;
+
+            if (free)
+            {
+                _disposed = true;
+            }
+        }
+
+        if (!free)
         {
             return;
         }
 
-        if (Volatile.Read(ref _activeContexts) > 0)
-        {
-            throw new InvalidOperationException("Cannot dispose a SeasonLlmModel while one or more contexts are still alive.");
-        }
+        FreeNative();
+        GC.SuppressFinalize(this);
+    }
 
-        _disposed = true;
-
+    private void FreeNative()
+    {
         if (_loraAdapter != IntPtr.Zero)
         {
             NativeMethods.llama_adapter_lora_free(_loraAdapter);
@@ -612,8 +665,6 @@ public sealed class SeasonLlmModel : IDisposable
             NativeMethods.llama_model_free(_handle);
             _handle = IntPtr.Zero;
         }
-
-        GC.SuppressFinalize(this);
     }
 
     ~SeasonLlmModel()

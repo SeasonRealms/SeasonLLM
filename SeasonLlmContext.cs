@@ -14,8 +14,21 @@ public sealed class SeasonLlmContext : IDisposable
 
     private IntPtr _handle;
     private MtmdContextHandle? _mtmdContext;
-    private bool _disposed;
     private int _position;
+
+    // Native handles may only be freed once no call is still inside llama/mtmd.
+    // llama_free while another thread sits in llama_decode or in the CLIP encoder
+    // is a use-after-free that kills the process, and the abort callback cannot
+    // interrupt the image encoder, so a cancelled image run can stay in native
+    // code for seconds after Cancel(). Dispose() therefore only requests the
+    // release; the last operation that leaves performs it.
+    private readonly object _gate = new();
+    private readonly object _mtmdGate = new();
+    private int _activeOperations;
+    private int _nativeReleased;
+    private bool _freeRequested;
+    private bool _freed;
+    private bool _modelRented;
 
     internal SeasonLlmContext(SeasonLlmModel model, SeasonLlmContextOptions options)
     {
@@ -25,6 +38,7 @@ public sealed class SeasonLlmContext : IDisposable
 
         _model = model;
         _model.RentContext();
+        _modelRented = true;
 
         try
         {
@@ -54,13 +68,9 @@ public sealed class SeasonLlmContext : IDisposable
         }
         catch
         {
-            if (_handle != IntPtr.Zero)
-            {
-                NativeMethods.llama_free(_handle);
-                _handle = IntPtr.Zero;
-            }
-
-            _model.ReturnContext();
+            // Goes through the same idempotent release as Dispose so the finalizer
+            // (registered before this constructor ran) cannot return the model rent twice.
+            FreeNative();
             throw;
         }
     }
@@ -71,7 +81,7 @@ public sealed class SeasonLlmContext : IDisposable
     {
         get
         {
-            ThrowIfDisposed();
+            using var operation = BeginOperation();
             return (int)NativeMethods.llama_n_ctx(_handle);
         }
     }
@@ -87,7 +97,7 @@ public sealed class SeasonLlmContext : IDisposable
 
     public void Reset()
     {
-        ThrowIfDisposed();
+        using var operation = BeginOperation();
         NativeMethods.llama_memory_clear(NativeMethods.llama_get_memory(_handle), true);
         _position = 0;
     }
@@ -195,6 +205,11 @@ public sealed class SeasonLlmContext : IDisposable
         Action<SeasonLlmGenerationChunk>? onChunk,
         CancellationToken cancellationToken)
     {
+        // Holds the native handles for the whole call; Dispose() defers the
+        // release to this lease's exit, so a cancel from the UI thread cannot
+        // free memory this thread is still using.
+        using var operation = BeginOperation();
+
         if (!options.UseExistingContext)
         {
             Reset();
@@ -231,6 +246,8 @@ public sealed class SeasonLlmContext : IDisposable
         CancellationToken cancellationToken,
         string? systemPrompt = null)
     {
+        using var operation = BeginOperation();
+
         System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] step 1: EnsureImageSupport");
         EnsureImageSupport();
 
@@ -508,47 +525,61 @@ public sealed class SeasonLlmContext : IDisposable
     private MtmdContextHandle EnsureMtmdContext()
     {
         ThrowIfDisposed();
-        if (_mtmdContext is not null)
+
+        var existing = _mtmdContext;
+        if (existing is not null)
         {
             System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: already initialized");
-            return _mtmdContext;
+            return existing;
         }
 
-        if (string.IsNullOrWhiteSpace(_model.MmprojPath))
+        // The text and translate panels share one context, so two image runs can
+        // reach this lazily-initialised projector at the same time. Loading it
+        // twice would leak a whole CLIP model and could publish a half-built handle.
+        lock (_mtmdGate)
         {
-            throw new InvalidOperationException("This model was not initialized with MmprojPath, so image input is unavailable.");
+            existing = _mtmdContext;
+            if (existing is not null)
+            {
+                return existing;
+            }
+
+            if (string.IsNullOrWhiteSpace(_model.MmprojPath))
+            {
+                throw new InvalidOperationException("This model was not initialized with MmprojPath, so image input is unavailable.");
+            }
+
+            System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: initializing mtmd, MmprojPath={_model.MmprojPath}");
+            using var strings = new Utf8StringArena();
+            var ctxParams = MtmdNativeMethods.mtmd_context_params_default();
+            System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: ctxParams_default returned, use_gpu={ctxParams.use_gpu}, n_threads={ctxParams.n_threads}");
+            ctxParams.use_gpu = NativeMethods.ToNativeBool(_model.MmprojUseGpu);
+            ctxParams.n_threads = _threadCount;
+            ctxParams.flash_attn_type = _flashAttentionType;
+            ctxParams.image_min_tokens = _model.ImageMinTokens;
+            ctxParams.image_max_tokens = _model.ImageMaxTokens;
+            ctxParams.warmup = 0;
+
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: calling mtmd_init_from_file");
+            var handle = MtmdNativeMethods.mtmd_init_from_file(strings.Add(_model.MmprojPath), _model.Handle, ctxParams);
+            System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: mtmd_init_from_file returned 0x{handle.ToInt64():X}");
+            if (handle == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("Failed to initialize mtmd with the configured mmproj file.");
+            }
+
+            var mtmd = new MtmdContextHandle(handle);
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: checking mtmd_support_vision");
+            if (!MtmdNativeMethods.mtmd_support_vision(handle))
+            {
+                mtmd.Dispose();
+                throw new InvalidOperationException("The configured mmproj/model pair does not expose vision input support.");
+            }
+
+            System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: mtmd initialized successfully");
+            _mtmdContext = mtmd;
+            return mtmd;
         }
-
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: initializing mtmd, MmprojPath={_model.MmprojPath}");
-        using var strings = new Utf8StringArena();
-        var ctxParams = MtmdNativeMethods.mtmd_context_params_default();
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: ctxParams_default returned, use_gpu={ctxParams.use_gpu}, n_threads={ctxParams.n_threads}");
-        ctxParams.use_gpu = NativeMethods.ToNativeBool(_model.MmprojUseGpu);
-        ctxParams.n_threads = _threadCount;
-        ctxParams.flash_attn_type = _flashAttentionType;
-        ctxParams.image_min_tokens = _model.ImageMinTokens;
-        ctxParams.image_max_tokens = _model.ImageMaxTokens;
-        ctxParams.warmup = 0;
-
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: calling mtmd_init_from_file");
-        var handle = MtmdNativeMethods.mtmd_init_from_file(strings.Add(_model.MmprojPath), _model.Handle, ctxParams);
-        System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] EnsureMtmdContext: mtmd_init_from_file returned 0x{handle.ToInt64():X}");
-        if (handle == IntPtr.Zero)
-        {
-            throw new InvalidOperationException("Failed to initialize mtmd with the configured mmproj file.");
-        }
-
-        var mtmd = new MtmdContextHandle(handle);
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: checking mtmd_support_vision");
-        if (!MtmdNativeMethods.mtmd_support_vision(handle))
-        {
-            mtmd.Dispose();
-            throw new InvalidOperationException("The configured mmproj/model pair does not expose vision input support.");
-        }
-
-        System.Diagnostics.Debug.WriteLine("[SeasonLLM][Image] EnsureMtmdContext: mtmd initialized successfully");
-        _mtmdContext = mtmd;
-        return mtmd;
     }
 
     private void EnsureImageSupport()
@@ -719,44 +750,127 @@ public sealed class SeasonLlmContext : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Requests the native release. When an operation is still running (for example
+    /// an image run that Cancel() could not interrupt inside the CLIP encoder), the
+    /// handles stay alive and the last operation to leave frees them, so a caller
+    /// that disposes while inference is in flight can never pull memory out from
+    /// under the inference thread. New operations fail with
+    /// <see cref="ObjectDisposedException"/> from the moment this is called.
+    /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        bool free;
+
+        lock (_gate)
         {
-            return;
+            if (_freeRequested)
+            {
+                return;
+            }
+
+            _freeRequested = true;
+            free = _activeOperations == 0 && !_freed;
+            _freed |= free;
         }
 
-        _disposed = true;
-
-        if (_handle != IntPtr.Zero)
+        if (free)
         {
-            NativeMethods.llama_free(_handle);
-            _handle = IntPtr.Zero;
+            FreeNative();
         }
 
-        _mtmdContext?.Dispose();
-        _mtmdContext = null;
-
-        _model.ReturnContext();
         GC.SuppressFinalize(this);
     }
 
     ~SeasonLlmContext()
     {
+        // Reaching the finalizer means nothing references this instance any more,
+        // so no operation can still be inside the native handles.
+        FreeNative();
+    }
+
+    private void FreeNative()
+    {
+        if (Interlocked.Exchange(ref _nativeReleased, 1) != 0)
+        {
+            return;
+        }
+
         if (_handle != IntPtr.Zero)
         {
             NativeMethods.llama_free(_handle);
             _handle = IntPtr.Zero;
-            _model.ReturnContext();
         }
 
         _mtmdContext?.Dispose();
         _mtmdContext = null;
+
+        if (_modelRented)
+        {
+            _modelRented = false;
+            _model.ReturnContext();
+        }
+    }
+
+    /// <summary>
+    /// Marks this context as in use for the duration of a call. The returned lease
+    /// is declared first in the method so it is released after every other cleanup,
+    /// including the abort-callback reset.
+    /// </summary>
+    private OperationLease BeginOperation()
+    {
+        lock (_gate)
+        {
+            if (_freeRequested)
+            {
+                throw new ObjectDisposedException(nameof(SeasonLlmContext));
+            }
+
+            _activeOperations++;
+        }
+
+        return new OperationLease(this);
+    }
+
+    private void EndOperation()
+    {
+        bool free;
+
+        lock (_gate)
+        {
+            if (_activeOperations > 0)
+            {
+                _activeOperations--;
+            }
+
+            free = _activeOperations == 0 && _freeRequested && !_freed;
+            _freed |= free;
+        }
+
+        if (free)
+        {
+            FreeNative();
+        }
     }
 
     private void ThrowIfDisposed()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_freed, this);
+    }
+
+    private readonly struct OperationLease : IDisposable
+    {
+        private readonly SeasonLlmContext _owner;
+
+        public OperationLease(SeasonLlmContext owner)
+        {
+            _owner = owner;
+        }
+
+        public void Dispose()
+        {
+            _owner.EndOperation();
+        }
     }
 
     private sealed class SamplerHandle : IDisposable
