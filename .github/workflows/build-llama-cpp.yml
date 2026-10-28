@@ -16,14 +16,16 @@ on:
         required: true
         default: "master"
       ggml_ref:
-        description: "SeasonRealms/ggml tag / branch / commit (must equal SeasonGGML's build)"
+        description: "SeasonRealms/ggml tag / branch / commit (must resolve to the ref the other packages build)"
         required: true
-        # The product ships ONE ggml: SeasonGGML publishes ggml.dll / ggml-cuda.dll /
-        # ggml-vulkan.dll from SeasonRealms/ggml's season branch tag, and every AI package
-        # is built against that same revision. Not "master": the season tag adds the
-        # fastdiv fix and the GGML_PREC_F32 FlashAttention patches the whole product
-        # relies on, and a ref skew here is a silent behaviour difference at run time.
-        default: "season-0.27.0-trellis1"
+        # The product ships ONE ggml: every package - SeasonGGML, this one,
+        # stable-diffusion, qwentts and SeasonThreeD - compiles SeasonRealms/ggml's
+        # master and ships the ggml*.dll it produced, so whichever package a module is
+        # taken from, it is the same module. master carries the fastdiv fix and the
+        # GGML_PREC_F32 FlashAttention patches the whole product relies on, and a ref
+        # skew here is a silent behaviour difference at run time. Deliberately not a
+        # tag: the commit this run resolved is recorded in the artifact manifest.
+        default: "master"
       cuda_version:
         description: "CUDA Toolkit version for the Windows and Linux builds, aligned with SeasonTTS"
         required: false
@@ -159,6 +161,12 @@ jobs:
             '-DLLAMA_OPENSSL=OFF',
             '-DGGML_BACKEND_DL=ON',
             '-DGGML_NATIVE=OFF',
+            # Same CPU module layout as SeasonGGML / SeasonImage / SeasonTTS /
+            # SeasonThreeD: ggml-cpu.dll dispatches to the per-ISA modules next to it.
+            # Without this the package would ship a single baseline ggml-cpu.dll, so a
+            # folder holding copies from several packages would end up with whichever
+            # layout was extracted last.
+            '-DGGML_CPU_ALL_VARIANTS=ON',
             '-DGGML_AVX2=ON',
             '-DGGML_CUDA=ON',
             '-DGGML_VULKAN=ON',
@@ -340,15 +348,45 @@ jobs:
           Ensure-ComponentDlls -Name "nvrtc" -Patterns @("nvrtc64_*.dll", "nvrtc*.dll") -RedistComponent "cuda_nvrtc" -Required $false
           Ensure-ComponentDlls -Name "cudnn" -Patterns @("cudnn*.dll") -RedistComponent "" -Required $false
 
+          # The runtime the model is loaded through, asserted rather than assumed:
+          # bin/ is copied wholesale, so a configure change that stops emitting one of
+          # these would otherwise only surface on a user's machine. ggml-cpu.dll is a
+          # dispatcher now (GGML_CPU_ALL_VARIANTS=ON) and is useless without the per-ISA
+          # modules beside it - hence the count, not just the name.
+          foreach ($name in @("ggml.dll", "ggml-base.dll", "ggml-cuda.dll", "ggml-vulkan.dll")) {
+            if (-not (Test-Path (Join-Path $out $name))) {
+              throw "Required GGML runtime is missing: $name"
+            }
+          }
+          $cpuBackends = @(Get-ChildItem $out -File | Where-Object { $_.Name -like 'ggml-cpu*.dll' } | Sort-Object Name)
+          if ($cpuBackends.Count -lt 2) {
+            throw "No per-ISA CPU GGML modules were produced (GGML_CPU_ALL_VARIANTS=ON expects ggml-cpu.dll plus ggml-cpu-<variant>.dll): $($cpuBackends.Name -join ', ')"
+          }
+          Write-Host ("ggml runtime packaged: {0}" -f (($cpuBackends | ForEach-Object { $_.Name }) -join ', '))
+
+          # ... and then none of them travel with the package. The CUDA runtime belongs
+          # to cudacudnn-runtime, which SeasonStudio.csproj stages next to every AI
+          # package in exactly this version; keeping a second copy here cost up to
+          # ~700 MB of download per artifact (cublasLt64_12 alone is ~500 MB). The
+          # checks above stay, because they prove the DLLs this build linked against
+          # exist - they just do not leave the runner.
+          $notPackaged = @(Get-ChildItem $out -File | Where-Object {
+            $_.Name -match '^(cudart|cublas|cublasLt|nvrtc|cufft|curand|cusparse|nvJitLink)\d+_\d+\.dll$' -or
+            $_.Name -like 'cudnn*.dll'
+          })
+          foreach ($dll in $notPackaged) { Remove-Item $dll.FullName -Force }
+          Write-Host ("not packaged (cudacudnn-runtime provides them): {0}" -f (($notPackaged | ForEach-Object { $_.Name }) -join ', '))
+
           $manifest = Join-Path $out "README.txt"
           @(
             "LLAMA_REPO: https://github.com/${{ env.LLAMA_REPO }}",
             "LLAMA_REF: ${{ github.event.inputs.llama_ref }}",
-            "Enabled backends: cpu-avx2, cuda12, vulkan",
+            "Enabled backends: cpu-all-variants, cuda12, vulkan",
             "Configuration: ${{ github.event.inputs.configuration }}",
             "GGML_REPO: ${{ env.GGML_REPO }}",
             "GGML_REF: ${{ github.event.inputs.ggml_ref }}",
             "GGML_MAX_NAME: 128",
+            "CUDA runtime: not packaged - cudart / cublas / cublasLt come from cudacudnn-runtime",
             "CUDA Toolkit version: ${{ github.event.inputs.cuda_version }}",
             "",
             "This build packages llama.cpp for win-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder.",
