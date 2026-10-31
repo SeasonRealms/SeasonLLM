@@ -18,13 +18,15 @@ on:
       ggml_ref:
         description: "SeasonRealms/ggml tag / branch / commit (must resolve to the ref the other packages build)"
         required: true
-        # The product ships ONE ggml: every package - SeasonGGML, this one,
-        # stable-diffusion, qwentts and SeasonThreeD - compiles SeasonRealms/ggml's
-        # master and ships the ggml*.dll it produced, so whichever package a module is
-        # taken from, it is the same module. master carries the fastdiv fix and the
-        # GGML_PREC_F32 FlashAttention patches the whole product relies on, and a ref
-        # skew here is a silent behaviour difference at run time. Deliberately not a
-        # tag: the commit this run resolved is recorded in the artifact manifest.
+        # The product ships ONE ggml runtime and ONE download source for it: the
+        # SeasonGGML build-ggml.yml artifacts. This workflow compiles SeasonRealms/ggml
+        # only because llama.cpp links against it - the ggml DLLs this build produces
+        # stay on the runner and are NOT packaged (see "Collect artifacts"), so ggml_ref
+        # has to resolve to the ref SeasonGGML's ggml-* artifacts were built from.
+        # master carries the fastdiv fix and the GGML_PREC_F32 FlashAttention patches
+        # the whole product relies on, and a ref skew here is a silent behaviour
+        # difference at run time. Deliberately not a tag: the commit this run resolved
+        # is recorded in the artifact manifest.
         default: "master"
       cuda_version:
         description: "CUDA Toolkit version for the Windows and Linux builds, aligned with SeasonTTS"
@@ -258,9 +260,6 @@ jobs:
           }
 
           Copy-Item LICENSE -Destination (Join-Path $out "llama.cpp.txt")
-          if (Test-Path "ggml/LICENSE") {
-            Copy-Item "ggml/LICENSE" -Destination (Join-Path $out "ggml.txt")
-          }
 
           foreach ($header in @("include/llama.h", "include/llama-cpp.h")) {
             if (Test-Path $header) {
@@ -273,6 +272,19 @@ jobs:
           Get-ChildItem build -Recurse -File -Include "*.lib", "*.pdb" | ForEach-Object {
             Copy-Item $_.FullName -Destination (Join-Path $out $_.Name) -Force
           }
+
+          # ... and neither does the ggml runtime: bin/ and the .lib/.pdb sweep carry
+          # ggml.dll / ggml-base.dll / ggml-cpu-*.dll / ggml-cuda.dll / ggml-vulkan.dll
+          # (plus their import libraries and symbols) because this build compiled ggml
+          # from SeasonRealms/ggml to link llama against it. build-ggml.yml (SeasonGGML)
+          # is the single download source for that runtime, so the copies are removed
+          # here; the assertions further down read them from bin/, where they must still
+          # exist, and prove this run produced a complete runtime.
+          $ggmlPackaged = @(Get-ChildItem $out -Recurse -File | Where-Object {
+            $_.Name -match '^ggml.*\.(dll|lib|pdb|exp|ilk)$'
+          })
+          foreach ($file in $ggmlPackaged) { Remove-Item $file.FullName -Force }
+          Write-Host ("not packaged (build-ggml.yml provides them): {0}" -f (($ggmlPackaged | ForEach-Object { $_.Name } | Sort-Object -Unique) -join ', '))
 
           if (-not $env:CUDA_PATH) {
             throw "CUDA_PATH is not set after installing CUDA Toolkit."
@@ -410,21 +422,23 @@ jobs:
           Ensure-ComponentDlls -Name "nvrtc" -Patterns @("nvrtc64_*.dll", "nvrtc*.dll") -RedistComponent "cuda_nvrtc" -Required $false
           Ensure-ComponentDlls -Name "cudnn" -Patterns @("cudnn*.dll") -RedistComponent "" -Required $false
 
-          # The runtime the model is loaded through, asserted rather than assumed:
-          # bin/ is copied wholesale, so a configure change that stops emitting one of
-          # these would otherwise only surface on a user's machine. ggml-cpu.dll is a
-          # dispatcher now (GGML_CPU_ALL_VARIANTS=ON) and is useless without the per-ISA
-          # modules beside it - hence the count, not just the name.
+          # The runtime the model is loaded through, asserted rather than assumed, and
+          # read from bin/ rather than from the package: ggml is not shipped here (see the
+          # strip above), but a configure change that stops emitting one of these would
+          # otherwise only surface on a user's machine, once SeasonGGML's artifact is
+          # staged next to llama.dll. ggml-cpu.dll is a dispatcher now
+          # (GGML_CPU_ALL_VARIANTS=ON) and is useless without the per-ISA modules beside
+          # it - hence the count, not just the name.
           foreach ($name in @("ggml.dll", "ggml-base.dll", "ggml-cuda.dll", "ggml-vulkan.dll")) {
-            if (-not (Test-Path (Join-Path $out $name))) {
-              throw "Required GGML runtime is missing: $name"
+            if (-not (Test-Path (Join-Path $binDir $name))) {
+              throw "Required GGML runtime was not produced: $name"
             }
           }
-          $cpuBackends = @(Get-ChildItem $out -File | Where-Object { $_.Name -like 'ggml-cpu*.dll' } | Sort-Object Name)
+          $cpuBackends = @(Get-ChildItem $binDir -File | Where-Object { $_.Name -like 'ggml-cpu*.dll' } | Sort-Object Name)
           if ($cpuBackends.Count -lt 2) {
             throw "No per-ISA CPU GGML modules were produced (GGML_CPU_ALL_VARIANTS=ON expects ggml-cpu.dll plus ggml-cpu-<variant>.dll): $($cpuBackends.Name -join ', ')"
           }
-          Write-Host ("ggml runtime packaged: {0}" -f (($cpuBackends | ForEach-Object { $_.Name }) -join ', '))
+          Write-Host ("ggml runtime linked against, not packaged: {0}" -f (($cpuBackends | ForEach-Object { $_.Name }) -join ', '))
 
           # ... and then none of them travel with the package. The CUDA runtime belongs
           # to cudacudnn-runtime, which SeasonStudio.csproj stages next to every AI
@@ -451,7 +465,9 @@ jobs:
             "CUDA runtime: not packaged - cudart / cublas / cublasLt come from cudacudnn-runtime",
             "CUDA Toolkit version: ${{ github.event.inputs.cuda_version }}",
             "",
-            "This build packages llama.cpp for win-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder.",
+            "This build packages llama.cpp for win-x64 and links the ggml runtime dynamically (shared ggml backends), so CPU (all x86 variants), CUDA and Vulkan stay available from the one multi-backend runtime folder.",
+            "ggml runtime: NOT PACKAGED - build-ggml.yml (SeasonGGML, artifact ggml-win-x64-multi-backend-*) is the single download source for ggml.dll / ggml-base.dll / ggml-cpu-*.dll / ggml-cuda.dll / ggml-vulkan.dll (same ggml_ref, GGML_MAX_NAME=160). Stage that artifact next to this one; llama.dll and the tools resolve it by name.",
+            "CPU backend DLLs this build was linked against (shipped by the SeasonGGML artifact): " + (($cpuBackends | ForEach-Object { $_.Name } | Sort-Object -Unique) -join ', '),
             "",
             "The builds carry no embedded web UI (LLAMA_BUILD_UI=OFF, LLAMA_USE_PREBUILT_UI=OFF: no npm build and no prebuilt UI download); llama-server serves the HTTP API only.",
             "",
@@ -618,9 +634,6 @@ jobs:
           fi
 
           cp LICENSE "$out/llama.cpp.txt"
-          if [ -f ggml/LICENSE ]; then
-            cp ggml/LICENSE "$out/ggml.txt"
-          fi
 
           for header in include/llama.h include/llama-cpp.h; do
             if [ -f "$header" ]; then
@@ -635,9 +648,20 @@ jobs:
           # look for at runtime.
           cp -RL build/bin/. "$out/"
 
+          # The ggml runtime is removed again: build-ggml.yml (SeasonGGML) is the single
+          # download source for libggml*.so, and bin/ only holds it because this build
+          # compiled ggml from SeasonRealms/ggml to link llama against it. The checks
+          # below read build/bin, which must still contain the complete runtime.
+          ggml_packaged=$(find "$out" -name 'libggml*.so*' | sort)
+          if [ -n "$ggml_packaged" ]; then
+            echo "$ggml_packaged" | xargs -r rm -f
+            echo "not packaged (build-ggml.yml provides them):"
+            echo "$ggml_packaged"
+          fi
+
           for name in libllama.so libggml.so libggml-base.so libggml-cpu.so libggml-cuda.so libggml-vulkan.so; do
-            if [ ! -f "$out/$name" ]; then
-              echo "Required llama.cpp runtime is missing: $name" >&2
+            if ! find build/bin -name "$name" | grep -q .; then
+              echo "Required llama.cpp / GGML runtime was not produced: $name" >&2
               exit 1
             fi
           done
@@ -652,7 +676,8 @@ jobs:
             echo "GGML_MAX_NAME: 160"
             echo "CUDA Toolkit version (build time only): ${{ github.event.inputs.cuda_version }}"
             echo ""
-            echo "This build packages llama.cpp for linux-x64 with shared ggml backends, keeping CPU AVX2, CUDA and Vulkan available from one multi-backend runtime folder."
+            echo "This build packages llama.cpp for linux-x64 and links the ggml runtime dynamically (shared ggml backends), so CPU, CUDA and Vulkan stay available from the one multi-backend runtime folder."
+            echo "ggml runtime: NOT PACKAGED - build-ggml.yml (SeasonGGML, artifact ggml-linux-x64-multi-backend-*) is the single download source for libggml.so / libggml-base.so / libggml-cpu*.so / libggml-cuda.so / libggml-vulkan.so (same ggml_ref, GGML_MAX_NAME=160). Stage that artifact next to this one; libllama.so and the tools resolve it by SONAME."
             echo ""
             echo "The builds carry no embedded web UI (LLAMA_BUILD_UI=OFF, LLAMA_USE_PREBUILT_UI=OFF: no npm build and no prebuilt UI download); llama-server serves the HTTP API only."
             echo ""
@@ -951,6 +976,7 @@ jobs:
             echo "This build packages a single self-contained llama.cpp runtime for ${RID}."
             echo "Apple Silicon only: no x86_64 slice is produced, so this runtime does not load on Intel Macs. Add a maccatalyst-x64 build if Intel support is needed again."
             echo "Static linkage: llama, ggml and every backend are archived into libllama.dylib and registered at runtime by ggml's backend registry; nothing is dlopen'd, so the app bundle contains a single Mach-O to sign."
+            echo "ggml: compiled INTO libllama.dylib, so this artifact ships no separate libggml file - unlike win-x64 / linux-x64 / android-arm64 there is nothing here to hand over to the SeasonGGML artifact, and ggml.txt stays because ggml's code is redistributed inside this Mach-O. The libggml.dylib the app bundle also carries is SeasonGGML's own artifact and is not shared with this one."
             echo "libmtmd.dylib is a thin re-export shim forwarding every symbol to libllama.dylib, so DllImport(\"mtmd\") and DllImport(\"llama\") share one copy of llama/ggml state."
             echo "CPU targets the M1 baseline (armv8.2-a+dotprod). GGML_CPU_ALL_VARIANTS is intentionally NOT used because it requires GGML_BACKEND_DL; M1 and every later Apple Silicon chip run this baseline."
             echo "Metal uses GGML_METAL_EMBED_LIBRARY so the shader source travels inside libllama.dylib; no default.metallib has to be deployed or located in the app bundle."
@@ -1294,6 +1320,7 @@ jobs:
             echo "On iOS both the llama and mtmd P/Invoke bindings are meant to bind as __Internal (unlike the libllama/libmtmd dylibs used on Mac Catalyst), so the app statically links libllama.a via NativeReference (Kind=Static); the merged archive exports the llama, mtmd and ggml entry points from one file."
             echo "Static linkage: llama, mtmd, ggml and every backend are archived into the single libllama.a and registered at runtime by ggml's backend registry; nothing is dlopen'd."
             echo "Self-contained: a complete ggml build is merged in. If several self-contained ggml-based archives (ggml, llama, qwentts, ...) are linked into the same app, keep exactly one ForceLoad=True owner; otherwise the duplicate ggml objects clash at link time."
+            echo "ggml: merged INTO libllama.a, so this artifact ships no separate libggml.a - unlike win-x64 / linux-x64 / android-arm64 there is nothing here to hand over to the SeasonGGML libggml.xcframework, and ggml.txt stays because ggml's code is redistributed inside this archive. When libllama.a is the ForceLoad=True owner, this embedded ggml copy is the one ggml-only P/Invokes resolve to."
             echo "This build compiles ggml with GGML_MAX_NAME=160 (the upstream default is 64) so the ggml_tensor layout matches the other ggml-based runtimes linked into the same app (qwentts, stable-diffusion and SeasonGGML, which all use 160)."
             echo "CPU targets the M1 baseline (armv8.2-a+dotprod), supported by every A12+ device and every Apple Silicon simulator."
             echo "Metal uses GGML_METAL_EMBED_LIBRARY so the shader source travels inside libllama.a; no default.metallib has to be deployed or located in the app bundle."
@@ -1436,9 +1463,6 @@ jobs:
           mkdir -p "$out"
 
           cp LICENSE "$out/llama.cpp.txt"
-          if [ -f ggml/LICENSE ]; then
-            cp ggml/LICENSE "$out/ggml.txt"
-          fi
 
           for header in include/llama.h include/llama-cpp.h; do
             if [ -f "$header" ]; then
@@ -1452,16 +1476,27 @@ jobs:
           # only defends against toolchain changes that would reintroduce the
           # Linux-style symlink chain. Tools are OFF, so bin/ holds libraries
           # only and a targeted library copy is more precise than cp -RL bin/.
+          # libggml*.so is deliberately not copied: build-ggml.yml (SeasonGGML) is the
+          # single download source for the ggml runtime, and this build only produced it
+          # to link llama/mtmd against it.
           find build-android -name 'libllama.so*' -exec cp -Lf {} "$out/" \;
           find build-android -name 'libmtmd.so*' -exec cp -Lf {} "$out/" \;
-          find build-android -name 'libggml*.so*' -exec cp -Lf {} "$out/" \;
 
-          for name in libllama.so libmtmd.so libggml.so libggml-base.so libggml-cpu.so; do
+          for name in libllama.so libmtmd.so; do
             if [ ! -f "$out/$name" ]; then
               echo "Required llama.cpp runtime is missing: $name" >&2
               exit 1
             fi
           done
+
+          for name in libggml.so libggml-base.so libggml-cpu.so; do
+            if ! find build-android -name "$name" | grep -q .; then
+              echo "Required GGML runtime was not produced: $name" >&2
+              exit 1
+            fi
+          done
+          echo "ggml runtime not packaged (build-ggml.yml provides it):"
+          find build-android -name 'libggml*.so' -printf '  %f\n' | sort -u
 
           {
             echo "Platform: ${RID} (ABI: ${ABI}; deployed under jniLibs/lib/${ABI})"
@@ -1485,7 +1520,7 @@ jobs:
             echo "CUDA, Vulkan and OpenMP do not exist on the Android target and are explicitly disabled."
             echo "The NDK links 16 KB page-size aligned libraries by default; every shipped .so is re-checked below (Play requirement)."
             echo ""
-            echo "The ggml core libraries (libggml.so, libggml-base.so, libggml-cpu.so) are also produced by the SeasonGGML / stable-diffusion / qwentts Android builds from the same ggml ref; ship exactly ONE copy of them inside the APK and let libllama.so / libstable-diffusion.so / libqwen.so resolve it via DT_NEEDED."
+            echo "ggml runtime: NOT PACKAGED - build-ggml.yml (SeasonGGML, artifact ggml-android-arm64-multi-backend-*) is the single download source for libggml.so / libggml-base.so / libggml-cpu.so (same ggml_ref, GGML_MAX_NAME=160). Ship that one inside jniLibs/lib/${ABI} and let libllama.so / libmtmd.so resolve it via DT_NEEDED; a copy from this artifact would only duplicate it."
             echo ""
             echo "Artifact contents:"
             (cd "$out" && ls -1 | sort)
