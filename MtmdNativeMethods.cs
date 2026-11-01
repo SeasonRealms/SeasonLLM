@@ -21,6 +21,8 @@ internal static class MtmdNativeMethods
     internal struct NativeMtmdContextParams
     {
         public byte use_gpu;
+        // ggml_backend_dev_t: device the projector runs on (NULL = pick automatically).
+        public IntPtr device;
         public byte print_timings;
         public int n_threads;
         public IntPtr image_marker;
@@ -36,12 +38,32 @@ internal static class MtmdNativeMethods
         public IntPtr progress_callback_user_data;
     }
 
+    // Mirrors mtmd_input_text. The size_t text_len sits between the pointer and the two
+    // booleans; without it mtmd_tokenize() reads the length from a garbage slot and the
+    // booleans from the upper half of the text pointer.
     [StructLayout(LayoutKind.Sequential)]
     internal struct NativeMtmdInputText
     {
         public IntPtr text;
+        public nuint text_len;
         public byte add_special;
         public byte parse_special;
+    }
+
+    // Mirrors mtmd_helper_init_opt / mtmd_helper_video_init_params. Only the video branch
+    // reads it, and a zeroed value means "native fps, no timestamps, ffmpeg from PATH".
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeMtmdHelperVideoInitParams
+    {
+        public float fps_target;
+        public IntPtr ffmpeg_bin_dir;
+        public long timestamp_interval_ms;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeMtmdHelperInitOpt
+    {
+        public NativeMtmdHelperVideoInitParams video_params;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -68,7 +90,8 @@ internal static class MtmdNativeMethods
     internal static extern bool mtmd_support_vision(IntPtr ctx);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-    internal static extern NativeMtmdBitmapWrapper mtmd_helper_bitmap_init_from_buf(IntPtr ctx, byte[] buf, nuint len, [MarshalAs(UnmanagedType.I1)] bool placeholder);
+    internal static extern NativeMtmdBitmapWrapper mtmd_helper_bitmap_init_from_buf(
+        IntPtr ctx, byte[] buf, nuint len, [MarshalAs(UnmanagedType.I1)] bool placeholder, NativeMtmdHelperInitOpt opt);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern IntPtr mtmd_input_chunks_init();

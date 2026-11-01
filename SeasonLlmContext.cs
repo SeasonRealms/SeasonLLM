@@ -445,7 +445,8 @@ public sealed class SeasonLlmContext : IDisposable
         System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImageBitmap: imageBytes.Length={imageBytes?.Length ?? -1}");
         var mtmd = EnsureMtmdContext();
         System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImageBitmap: mtmd.Handle=0x{mtmd.Handle.ToInt64():X}");
-        var wrapper = MtmdNativeMethods.mtmd_helper_bitmap_init_from_buf(mtmd.Handle, imageBytes, (nuint)imageBytes.Length, false);
+        var wrapper = MtmdNativeMethods.mtmd_helper_bitmap_init_from_buf(
+            mtmd.Handle, imageBytes, (nuint)imageBytes.Length, false, default);
         System.Diagnostics.Debug.WriteLine($"[SeasonLLM][Image] CreateImageBitmap: wrapper.bitmap=0x{wrapper.bitmap.ToInt64():X}");
         if (wrapper.bitmap == IntPtr.Zero)
         {
@@ -483,6 +484,10 @@ public sealed class SeasonLlmContext : IDisposable
         var input = new MtmdNativeMethods.NativeMtmdInputText
         {
             text = inputTextPtr,
+            // mtmd_tokenize() reads the prompt through text_len, so it has to match the
+            // UTF-8 bytes Utf8StringArena handed over - not the UTF-16 char count. A null
+            // prompt stays a zero pointer, which the zero length matches.
+            text_len = (nuint)System.Text.Encoding.UTF8.GetByteCount(promptText ?? string.Empty),
             add_special = NativeMethods.ToNativeBool(options.AddSpecialTokens),
             parse_special = NativeMethods.ToNativeBool(options.ParseSpecialTokens)
         };
@@ -622,6 +627,7 @@ public sealed class SeasonLlmContext : IDisposable
                 NativeMethods.llama_sampler_chain_add(
                     chain,
                     NativeMethods.llama_sampler_init_penalties(
+                        _model.VocabularySize,
                         options.RepeatLastTokens,
                         options.RepeatPenalty,
                         options.FrequencyPenalty,

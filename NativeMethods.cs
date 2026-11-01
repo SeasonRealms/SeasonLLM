@@ -16,6 +16,18 @@ internal static class NativeMethods
 #endif
     internal const int LlamaTokenNull = -1;
 
+    // llama_load_mode: the single value llama.cpp takes in place of the use_mmap /
+    // use_mlock / use_direct_io booleans its model params used to carry.
+    internal const int LlamaLoadModeAuto = -1;
+    internal const int LlamaLoadModeNone = 0;
+    internal const int LlamaLoadModeMmap = 1;
+    internal const int LlamaLoadModeMlock = 2;
+    internal const int LlamaLoadModeMmapMlock = 3;
+    internal const int LlamaLoadModeDirectIo = 4;
+
+    // Mirrors llama_model_params field for field. llama_model_default_params() writes the
+    // whole struct, so a missing or reordered field does not merely misread one value - it
+    // overruns the managed allocation and corrupts everything that follows.
     [StructLayout(LayoutKind.Sequential)]
     internal struct NativeLlamaModelParams
     {
@@ -23,19 +35,21 @@ internal static class NativeMethods
         public IntPtr tensor_buft_overrides;
         public int n_gpu_layers;
         public int split_mode;
+        // load_mode / lazy_mode sit between split_mode and main_gpu; the booleans they
+        // replace no longer exist, so a struct that keeps them shifts every pointer below.
+        public int load_mode;
+        public int lazy_mode;
         public int main_gpu;
         public IntPtr tensor_split;
         public IntPtr progress_callback;
         public IntPtr progress_callback_user_data;
         public IntPtr kv_overrides;
         public byte vocab_only;
-        public byte use_mmap;
-        public byte use_direct_io;
-        public byte use_mlock;
         public byte check_tensors;
         public byte use_extra_bufts;
         public byte no_host;
         public byte no_alloc;
+        public byte load_mtp;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -47,6 +61,7 @@ internal static class NativeMethods
         public uint n_seq_max;
         public uint n_rs_seq;
         public uint n_outputs_max;
+        public uint n_outputs_max_per_seq;
         public int n_threads;
         public int n_threads_batch;
         public int ctx_type;
@@ -66,6 +81,8 @@ internal static class NativeMethods
         public IntPtr cb_eval_user_data;
         public int type_k;
         public int type_v;
+        // size_t: host-side expert cache budget for MoE models, 0 = disabled.
+        public nuint moe_cache_size;
         public IntPtr abort_callback;
         public IntPtr abort_callback_data;
         public byte embeddings;
@@ -280,8 +297,12 @@ internal static class NativeMethods
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern IntPtr llama_sampler_init_grammar(IntPtr vocab, IntPtr grammarStr, IntPtr grammarRoot);
 
+    // n_vocab leads the argument list: the sampler sizes its penalty ring buffer from it.
+    // Omitting it does not fail to bind - the callee reads whatever sits in the next
+    // register and the first sample() walks off the end of that buffer.
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-    internal static extern IntPtr llama_sampler_init_penalties(int penaltyLastN, float penaltyRepeat, float penaltyFreq, float penaltyPresent);
+    internal static extern IntPtr llama_sampler_init_penalties(
+        int nVocab, int penaltyLastN, float penaltyRepeat, float penaltyFreq, float penaltyPresent);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     internal static extern int llama_sampler_sample(IntPtr sampler, IntPtr ctx, int idx);

@@ -137,9 +137,7 @@ public sealed class SeasonLlmModel : IDisposable
         native.devices = backendDevices?.Pointer ?? IntPtr.Zero;
         native.n_gpu_layers = gpuLayers;
         native.main_gpu = options.MainGpu;
-        native.use_mmap = NativeMethods.ToNativeBool(options.UseMmap);
-        native.use_mlock = NativeMethods.ToNativeBool(options.UseMlock);
-        native.use_direct_io = NativeMethods.ToNativeBool(options.UseDirectIo);
+        native.load_mode = MapLoadMode(options);
         native.check_tensors = NativeMethods.ToNativeBool(options.CheckTensors);
         native.vocab_only = NativeMethods.ToNativeBool(options.VocabularyOnly);
 
@@ -150,6 +148,24 @@ public sealed class SeasonLlmModel : IDisposable
         }
 
         return NativeMethods.llama_model_load_from_file(strings.Add(options.ModelPath), native);
+    }
+
+    /// llama.cpp folded the three loading booleans into one llama_load_mode value. Direct I/O
+    /// wins over mmap because the two are mutually exclusive there, and mlock only ever
+    /// pairs with mmap.
+    private static int MapLoadMode(SeasonLlmModelOptions options)
+    {
+        if (options.UseDirectIo)
+        {
+            return NativeMethods.LlamaLoadModeDirectIo;
+        }
+
+        if (options.UseMlock)
+        {
+            return options.UseMmap ? NativeMethods.LlamaLoadModeMmapMlock : NativeMethods.LlamaLoadModeMlock;
+        }
+
+        return options.UseMmap ? NativeMethods.LlamaLoadModeMmap : NativeMethods.LlamaLoadModeNone;
     }
 
     public string ModelPath { get; }
